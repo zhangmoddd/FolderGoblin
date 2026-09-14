@@ -30,3 +30,6 @@ FolderSizeAnalyzer/
 FolderSizeAnalyzer.exe
 *.spec
 _build_tmp/
+
+# ===== worktree：多 AI 并行开发的工作副本 =====
+worktrees/
