@@ -24,3 +24,8 @@ desktop.ini
 # ===== 临时输出 =====
 *.tmp
 *.log
+
+# ===== 打包产物 =====
+FolderSizeAnalyzer.exe
+*.spec
+_build_tmp/
