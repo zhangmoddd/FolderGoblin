@@ -26,6 +26,7 @@ desktop.ini
 *.log
 
 # ===== 打包产物 =====
+FolderSizeAnalyzer/
 FolderSizeAnalyzer.exe
 *.spec
 _build_tmp/
