@@ -1,0 +1,26 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ===== C++ 构建产物 =====
+build/
+cmake-build-*/
+*.o
+*.obj
+*.pdb
+*.ilk
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 临时输出 =====
+*.tmp
+*.log
