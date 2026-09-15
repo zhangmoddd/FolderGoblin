@@ -11,7 +11,21 @@ import time
 import unittest
 from pathlib import Path
 
-from file_size_gui import AnalysisThread, FolderSizeGUI
+from file_size_gui import AnalysisThread, FolderSizeGUI, elide_middle
+
+
+class ElideTests(unittest.TestCase):
+    def test_short_text_is_untouched(self):
+        self.assertEqual(elide_middle('D:\\a\\b.txt', 40), 'D:\\a\\b.txt')
+
+    def test_long_path_keeps_head_and_tail(self):
+        """路径太长从中间掐：头上的盘符和尾上的文件名都得留着。"""
+        text = 'D:\\' + ('很长的目录名\\' * 20) + 'ml.pak'
+        out = elide_middle(text, 40)
+        self.assertLessEqual(len(out), 40)
+        self.assertTrue(out.startswith('D:\\'))
+        self.assertTrue(out.endswith('ml.pak'))
+        self.assertIn('…', out)
 
 
 class ScannerTests(unittest.TestCase):
@@ -214,6 +228,20 @@ class PlaceholderRowTests(unittest.TestCase):
                     for row in self.gui.tree.get_children(item)]
         self.assertIn(('sub', 'a.txt'), children)
         self.assertIn(('sub', 'deep'), children)
+
+    def test_status_bar_tells_you_where_a_row_lives(self):
+        """层级深的时候，点一行就得知道它在谁的里面 —— 状态栏写完整路径。"""
+        self.gui.tree.item(self.gui.path_to_item[('sub',)], open=True)
+        self.gui.on_tree_open(None)
+        self.pump()
+        row = self.gui.path_to_item[('sub', 'a.txt')]
+        self.gui.tree.selection_set(row)
+        self.gui.on_tree_select(None)
+
+        text = self.gui.path_label.cget('text')
+        self.assertIn('sub', text)
+        self.assertIn('a.txt', text)
+        self.assertIn(Path(self.tmp.name).name, text)     # 根目录也得在里头
 
     def test_expand_all_and_search_leave_no_placeholder_behind(self):
         self.gui.expand_all()

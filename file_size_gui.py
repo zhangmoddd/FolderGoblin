@@ -109,6 +109,18 @@ def pad_left(text: str, width: int) -> str:
     return ' ' * max(0, width - display_width(text)) + text
 
 
+def elide_middle(text: str, limit: int) -> str:
+    """太长了就从中间掐掉，头和尾都留着。
+
+    路径不能掐尾巴 —— 掐了尾巴就不知道是哪个文件了；也不能只留尾巴 —— 那就看不出在哪个盘。
+    """
+    if len(text) <= limit:
+        return text
+    keep = max(1, limit - 1)
+    head = int(keep * 0.45)
+    return text[:head] + '…' + text[len(text) - (keep - head):]
+
+
 def format_size(bytes_size: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB", "PB"]
     unit_idx = 0
@@ -524,6 +536,10 @@ class FolderSizeGUI:
         self._child_counts = {}       # 文件夹路径 -> 里面已经数到几项（占位行上就写这个真数）
         self._last_click_item = ''
         self._scanning = False        # 是不是在扫（决定要不要刷标题栏那排数字）
+        self._hover_item = ''         # 鼠标现在压在哪一行（悬停提示用）
+        self._tip_job = None          # 悬停提示的定时器
+        self._tip = None              # 悬停提示那个小气泡（第一次用的时候才造）
+        self._tip_label = None
         self._pre_search_open = None  # 搜索前的展开状态，清空搜索时恢复用
         self._after_queue_label = None  # 队里这些行摆完之后，状态栏显示什么
 
@@ -812,14 +828,74 @@ class FolderSizeGUI:
         self.tree.bind("<Button-3>", self.show_context_menu)
         self.tree.bind("<Button-1>", self.on_tree_click)
         self.tree.bind("<ButtonRelease-1>", self.after_tree_click)
+        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        self.tree.bind("<Motion>", self.on_tree_motion)
+        self.tree.bind("<Leave>", lambda _event: self._hide_tip())
         self.tree.bind("<<TreeviewOpen>>", self.on_tree_open)
         self.tree.bind("<<TreeviewClose>>", self.on_tree_close)
+
+    # ---------- "这行是谁家的"：状态栏 + 悬停提示 ----------
+
+    def on_tree_select(self, event):
+        """选中哪一行，状态栏就写它的完整路径 —— 层级再深也知道自己在哪、在谁的里面。"""
+        selection = self.tree.selection()
+        relative = self.item_to_path.get(selection[0]) if selection else None
+        self.show_full_path(relative)
+
+    def show_full_path(self, relative_path):
+        if not self.analyzed_path:
+            self.path_label.config(text="")
+            return
+        if relative_path is None:
+            self.path_label.config(text=elide_middle(self.analyzed_path, 78))
+            return
+        full = str(Path(self.analyzed_path).joinpath(*relative_path))
+        self.path_label.config(text=elide_middle(full, 78))
+
+    def on_tree_motion(self, event):
+        """鼠标在列表上滑过：停够半秒，就把这一行的完整路径弹出来（不用点）。"""
+        item_id = self.tree.identify_row(event.y)
+        if item_id == self._hover_item:
+            return
+        self._hover_item = item_id
+        self._hide_tip()
+        if item_id:
+            self._tip_job = self.root.after(450, self._show_tip)
+
+    def _show_tip(self):
+        self._tip_job = None
+        relative = self.item_to_path.get(self._hover_item)
+        if relative is None or not self.analyzed_path:
+            return
+        text = elide_middle(str(Path(self.analyzed_path).joinpath(*relative)), 96)
+        if self._tip is None:
+            self._tip = tk.Toplevel(self.root)
+            self._tip.overrideredirect(True)
+            self._tip.attributes('-topmost', True)
+            self._tip_label = tk.Label(self._tip, text=text, font=(FONT, 9),
+                bg=Palette.text, fg='#FFFFFF', padx=self.px(8), pady=self.px(4),
+                justify='left')
+            self._tip_label.pack()
+        else:
+            self._tip_label.config(text=text)
+        x, y = self.root.winfo_pointerxy()
+        self._tip.geometry(f"+{x + self.px(14)}+{y + self.px(18)}")
+        self._tip.deiconify()
+        self._tip.lift()
+
+    def _hide_tip(self):
+        if self._tip_job is not None:
+            self.root.after_cancel(self._tip_job)
+            self._tip_job = None
+        if self._tip is not None and self._tip.winfo_ismapped():
+            self._tip.withdraw()
 
     # ---------- 滚动条：要才露脸 ----------
 
     def _on_tree_yscroll(self, first, last):
         """Tk 每滚一下、内容一变就会调这里。顺手判断竖直滚动条该不该露脸。"""
         self.scroll_y.set(first, last)
+        self._hide_tip()
         self._toggle_scrollbar(self.scroll_y, self.scroll_y.is_scrollable(),
                                side='right', fill='y',
                                padx=(0, self.px(2)), pady=self.px(2))
@@ -1200,6 +1276,7 @@ class FolderSizeGUI:
 
     def on_tree_click(self, event):
         self._last_click_item = self.tree.identify_row(event.y)
+        self._hide_tip()
 
     def after_tree_click(self, event):
         """手点完之后兜个底。
@@ -1260,6 +1337,7 @@ class FolderSizeGUI:
         self.item_to_node[root_id] = root if root else root_node
         self.path_to_item[()] = root_id
         self.item_to_path[root_id] = ()
+        self.show_full_path(None)       # 摆新列表了，状态栏先退回"整个文件夹"
         # 根下面也先垫一条（展开箭头），等真行摆上来就撤掉
         if root is not None and root.children:
             self._placeholder_of[()] = self.tree.insert(root_id, 'end',
