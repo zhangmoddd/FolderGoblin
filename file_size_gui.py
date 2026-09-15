@@ -7,6 +7,7 @@ import ctypes
 import gc
 import os
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -1437,6 +1438,15 @@ class FolderSizeGUI:
 
         self.root = tk.Tk()
         self.root.title("文件夹大小分析器")
+        # 窗口图标：源码跑找脚本旁边的 icon.ico；打包跑找解包目录里的（打包时用 --add-data 装进去）
+        for _base in (os.path.dirname(os.path.abspath(__file__)), getattr(sys, "_MEIPASS", "")):
+            _ico = os.path.join(_base, "icon.ico")
+            if os.path.exists(_ico):
+                try:
+                    self.root.iconbitmap(_ico)
+                except Exception:
+                    pass
+                break
         if self.dpi_ok:
             self.root.tk.call('tk', 'scaling', self.scale * 96.0 / 72.0)
         self.root.configure(bg=Palette.app_bg)
