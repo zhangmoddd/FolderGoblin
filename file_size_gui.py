@@ -1005,7 +1005,8 @@ class StructureWindow:
 
         头衔跟着层级走：最上层大字标题加"多大"，第二层中号粗体，
         再往下小字 —— 字越大越靠外，谁包着谁看字就知道。
-        地方小就不写 —— 硬写上去就是一堆 "steamap"、"Workbu"，比不写还乱。
+        横排放不下的窄高条，把字竖过来写（从下往上读）；矮墩小格子
+        宽度够就把名字掐短了写。实在一点地方没有的才留白。
         """
         roomy = self._label_roomy(width, height)
         if level <= 1 and roomy:
@@ -1015,18 +1016,29 @@ class StructureWindow:
         else:
             size, bold, with_info = 8, False, False
         font = self._font(size, bold=bold)
-        line1_bottom = self.px(5) + font.metrics('linespace')
-        if width < self.px(58) or height < line1_bottom + self.px(1):
+        line_h = self.px(5) + font.metrics('linespace')
+        if width >= self.px(58) and height >= line_h + self.px(1):
+            self.canvas.create_text(x + self.px(7), y + self.px(5), anchor='nw',
+                text=self._fit(node.name, width - self.px(14), size, bold=bold),
+                font=font, fill=Palette.text)
+            if with_info:
+                share = node.size / max(1, self.current().size) * 100.0
+                self.canvas.create_text(x + self.px(7), y + line_h + self.px(2),
+                    anchor='nw',
+                    text=f"{format_size(node.size)}  ·  占这里 {share:.1f}%",
+                    font=self._font(9), fill=Palette.text_muted)
             return
-        self.canvas.create_text(x + self.px(7), y + self.px(5), anchor='nw',
-            text=self._fit(node.name, width - self.px(14), size, bold=bold),
-            font=font, fill=Palette.text)
-        if with_info:
-            share = node.size / max(1, self.current().size) * 100.0
-            self.canvas.create_text(x + self.px(7), y + line1_bottom + self.px(2),
-                anchor='nw',
-                text=f"{format_size(node.size)}  ·  占这里 {share:.1f}%",
-                font=self._font(9), fill=Palette.text_muted)
+        if width >= self.px(16) and height >= self.px(58):
+            # 窄高条：横排一个字都放不下，竖过来写正好
+            self.canvas.create_text(x + width / 2.0, y + height / 2.0,
+                text=self._fit(node.name, height - self.px(12), 8),
+                font=self._font(8), fill=Palette.text, angle=90)
+            return
+        if width >= self.px(34) and height >= line_h + self.px(1):
+            # 矮墩块：横排挤得下几个字就掐短了写几个
+            self.canvas.create_text(x + self.px(4), y + self.px(4), anchor='nw',
+                text=self._fit(node.name, width - self.px(8), 8),
+                font=self._font(8), fill=Palette.text)
 
     def _render_mindmap(self, node):
         width, height = self._canvas_size()
