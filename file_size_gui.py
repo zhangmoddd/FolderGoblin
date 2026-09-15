@@ -454,11 +454,12 @@ class FolderSizeGUI:
             name = f'Clean.{orient}.TScrollbar'
             style.configure(name,
                 background='#C1C7CE',
-                troughcolor=Palette.surface,
-                bordercolor=Palette.surface,
-                darkcolor=Palette.surface,
-                lightcolor=Palette.surface,
-                arrowcolor=Palette.surface,
+                # 滑槽给点浅灰：列表里有三十万行时滑块只剩 1 像素，滑槽太白就等于隐形
+                troughcolor='#F0F1F3',
+                bordercolor='#F0F1F3',
+                darkcolor='#F0F1F3',
+                lightcolor='#F0F1F3',
+                arrowcolor='#F0F1F3',
                 borderwidth=0,
                 arrowsize=self.px(10),
                 width=self.px(10),
@@ -672,21 +673,20 @@ class FolderSizeGUI:
             highlightthickness=1, highlightbackground=Palette.border)
         tree_card.pack(side='left', fill='both', expand=True)
 
-        scroll_y = ttk.Scrollbar(tree_card, orient='vertical', style='Clean.Vertical.TScrollbar')
-        scroll_y.pack(side='right', fill='y', padx=(0, self.px(2)), pady=self.px(2))
-        scroll_x = ttk.Scrollbar(tree_card, orient='horizontal', style='Clean.Horizontal.TScrollbar')
-        scroll_x.pack(side='bottom', fill='x', padx=self.px(2), pady=(0, self.px(2)))
+        # 两条滚动条平时藏着 —— 一屏装得下就没必要杵着一条灰杠（装不下才自己冒出来）
+        self.scroll_y = ttk.Scrollbar(tree_card, orient='vertical', style='Clean.Vertical.TScrollbar')
+        self.scroll_x = ttk.Scrollbar(tree_card, orient='horizontal', style='Clean.Horizontal.TScrollbar')
 
         self.tree = ttk.Treeview(tree_card,
             style='Clean.Treeview',
             columns=('size', 'pct'),
             show='tree headings',
-            yscrollcommand=scroll_y.set,
-            xscrollcommand=scroll_x.set)
+            yscrollcommand=self._on_tree_yscroll,
+            xscrollcommand=self._on_tree_xscroll)
         self.tree.pack(side='left', fill='both', expand=True,
             padx=self.px(2), pady=self.px(2))
-        scroll_y.config(command=self.tree.yview)
-        scroll_x.config(command=self.tree.xview)
+        self.scroll_y.config(command=self.tree.yview)
+        self.scroll_x.config(command=self.tree.xview)
 
         self.tree.heading('#0', text="名称", anchor='w')
         self.tree.heading('size', text="大小", anchor='e')
@@ -704,6 +704,34 @@ class FolderSizeGUI:
         self.tree.bind("<ButtonRelease-1>", self.after_tree_click)
         self.tree.bind("<<TreeviewOpen>>", self.on_tree_open)
         self.tree.bind("<<TreeviewClose>>", self.on_tree_close)
+
+    # ---------- 滚动条：要才露脸 ----------
+
+    def _on_tree_yscroll(self, first, last):
+        """Tk 每滚一下、内容一变就会调这里。顺手判断竖直滚动条该不该露脸。"""
+        self.scroll_y.set(first, last)
+        self._toggle_scrollbar(self.scroll_y, float(last) - float(first) < 1.0,
+                               side='right', fill='y',
+                               padx=(0, self.px(2)), pady=self.px(2))
+
+    def _on_tree_xscroll(self, first, last):
+        """横向同理。列表一般装得下，所以这条平时根本不出现。"""
+        self.scroll_x.set(first, last)
+        self._toggle_scrollbar(self.scroll_x, float(last) - float(first) < 1.0,
+                               side='bottom', fill='x',
+                               padx=self.px(2), pady=(0, self.px(2)))
+
+    def _toggle_scrollbar(self, bar, needed: bool, side, fill, padx, pady):
+        """该露脸就摆上，不该露就收起来（一屏装得下的时候没必要杵着一条灰杠）。
+
+        摆的时候插在列表前头 —— 不然它排在列表后头，列表就会先把地方占光，它挤不进去。
+        """
+        if needed == bool(bar.winfo_manager()):
+            return
+        if needed:
+            bar.pack(side=side, fill=fill, padx=padx, pady=pady, before=self.tree)
+        else:
+            bar.pack_forget()
 
     def _build_statusbar(self):
         bar = tk.Frame(self.root, bg=Palette.surface,
