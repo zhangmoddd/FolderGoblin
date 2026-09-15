@@ -662,7 +662,6 @@ class StructureWindow:
     ROW_HEIGHT = 26         # 思维导图：一行多高（跟着缩放走）
     COLUMN_WIDTH = 232      # 思维导图：一层占多宽（跟着缩放走）
     MIN_BLOCK_PX = 3.0      # 方块小于这么多像素就不画了（画了也看不清）
-    HEADER_PX = 15.0        # 方块顶上留给名字的那条窄边
     GAP = 2.0               # 两块之间留条缝 —— 有缝才看得出"这儿是两块"，不然糊成一片
     MIN_ZOOM = 0.35
     MAX_ZOOM = 2.4
@@ -928,7 +927,7 @@ class StructureWindow:
         self._block_nodes[rect] = node
         self._block_rects[id(node)] = (x, y, width, height)
         self._draw_treemap_label(node, x, y, width, height)
-        header = self.px(self.HEADER_PX)
+        header = self._header_px(width, height)
         can_go_deeper = (node.is_dir and node.children
                          and level < self.levels() and height > header * 2)
         if not can_go_deeper:
@@ -938,22 +937,42 @@ class StructureWindow:
         for child, bx, by, bw, bh in inner:
             self._draw_treemap_block(child, bx, by, bw, bh, level + 1, family)
 
+    def _label_roomy(self, width, height):
+        """这块地方算不算宽敞：宽敞就写两行（名字 + 多大），窄就只写名字。"""
+        return width >= self.px(150) and height >= self.px(46)
+
+    def _header_px(self, width, height):
+        """方块顶上得给字留多高的地方。
+
+        以前写死 15 像素，可宽敞块要写两行字，两行得 40 多像素 ——
+        多出来的字全压到下面的子方块上，名字糊成一团。
+        字有多高直接问字体本人要，不写死，缩放、换电脑都不会错。
+        """
+        top = self.px(5)
+        if self._label_roomy(width, height):
+            two_lines = (self._font(11, bold=True).metrics('linespace')
+                         + self._font(9).metrics('linespace'))
+            return top + two_lines + self.px(4)
+        return top + self._font(8).metrics('linespace') + self.px(2)
+
     def _draw_treemap_label(self, node, x, y, width, height):
         """方块上写名儿。
 
         地方小就不写 —— 硬写上去就是一堆 "steamap"、"Workbu"，比不写还乱。
         地方大的（第一层那种大块）写大号字，再加一行"多大、占这里多少"。
         """
-        if width < self.px(58) or height < self.px(16):
-            return
-        roomy = width >= self.px(150) and height >= self.px(46)
+        roomy = self._label_roomy(width, height)
         size = 11 if roomy else 8
+        line1_bottom = self.px(5) + self._font(size, bold=roomy).metrics('linespace')
+        if width < self.px(58) or height < line1_bottom + self.px(1):
+            return
         self.canvas.create_text(x + self.px(7), y + self.px(5), anchor='nw',
             text=self._fit(node.name, width - self.px(14), size, bold=roomy),
             font=self._font(size, bold=roomy), fill=Palette.text)
         if roomy:
             share = node.size / max(1, self.current().size) * 100.0
-            self.canvas.create_text(x + self.px(7), y + self.px(26), anchor='nw',
+            self.canvas.create_text(x + self.px(7), y + line1_bottom + self.px(2),
+                anchor='nw',
                 text=f"{format_size(node.size)}  ·  占这里 {share:.1f}%",
                 font=self._font(9), fill=Palette.text_muted)
 
