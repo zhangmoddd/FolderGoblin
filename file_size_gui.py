@@ -192,18 +192,19 @@ def _take_row(items, side, scale):
     return row, area, len(row)
 
 
-def mindmap_rows(root, max_depth, min_size, row_height):
+def mindmap_rows(root, max_depth, min_size, row_height, collapsed=None):
     """思维导图排版：一层占一列，从上往下铺。
 
     返回 [(节点, 第几层, 中心 y), ...]，父在前、子在后，照着顺序画就行。
     地盘大的排前面（跟列表里一个顺序）。
+    collapsed 里放着的节点当成"收起来了"，它下面的就不铺（省得全铺开看不过来）。
     """
     rows = []
     cursor = [row_height / 2.0]
 
     def walk(node, level):
         kids = []
-        if level < max_depth:
+        if level < max_depth and not (collapsed and id(node) in collapsed):
             kids = [child for child in node.children if child.size >= min_size]
         if kids:
             centres = [walk(child, level + 1) for child in kids]
@@ -655,33 +656,43 @@ class StructureWindow:
     点一块钻进去看它里面，右键或按钮退回上一层，鼠标停住看完整路径。
     """
 
-    ROW_HEIGHT = 26         # 思维导图：一行多高
-    COLUMN_WIDTH = 232      # 思维导图：一层占多宽
+    ROW_HEIGHT = 26         # 思维导图：一行多高（跟着缩放走）
+    COLUMN_WIDTH = 232      # 思维导图：一层占多宽（跟着缩放走）
     MIN_BLOCK_PX = 3.0      # 方块小于这么多像素就不画了（画了也看不清）
     HEADER_PX = 15.0        # 方块顶上留给名字的那条窄边
+    GAP = 2.0               # 两块之间留条缝 —— 有缝才看得出"这儿是两块"，不然糊成一片
+    MIN_ZOOM = 0.35
+    MAX_ZOOM = 2.4
+    ZOOM_STEP = 1.12
+    MIN_SHARE = 0.05        # 小于百分之几的不画：最低就是 0.05%，再往下就成一堆线了
 
-    # 每一支一个颜色，浅深再分层级 —— 一眼能看出哪些块是"同一支"的
+    # 每一支一个色系、三个深浅（越浅离根越远）—— 一眼看出哪几块是"同一支"的。
+    # 都是柔和浅色配深字：一屏大色块也不刺眼。
     FAMILIES = (
-        ('#1D4ED8', '#3B82F6', '#BFDBFE'),
-        ('#0F766E', '#14B8A6', '#99F6E4'),
-        ('#6D28D9', '#8B5CF6', '#DDD6FE'),
-        ('#B45309', '#F59E0B', '#FDE68A'),
-        ('#BE123C', '#F43F5E', '#FECDD3'),
-        ('#047857', '#10B981', '#A7F3D0'),
-        ('#334155', '#64748B', '#CBD5E1'),
+        ('#93B4E6', '#BED2F1', '#E4EDFA'),   # 蓝
+        ('#8FCFC4', '#BCE2DB', '#E2F2EF'),   # 青
+        ('#B9A9E8', '#D5CDF2', '#EDE9FA'),   # 紫
+        ('#E8C77E', '#F1DCAE', '#F9F0DC'),   # 黄
+        ('#E9A3AE', '#F1C6CD', '#FAE6E9'),   # 粉
+        ('#93CEA9', '#BEE2CC', '#E2F1E8'),   # 绿
+        ('#B4BCC9', '#D2D7DE', '#EBEDF1'),   # 灰
     )
 
     def __init__(self, gui):
         self.gui = gui
         self.scale = gui.scale
-        self.font = tkfont.Font(family=FONT, size=8)
         self.stack = [gui.current_root]          # 钻进来的路径（最后一个就是现在看的）
         self.mode = tk.StringVar(value='treemap')
         self.depth = tk.IntVar(value=3)
         self.min_share = tk.DoubleVar(value=0.3)
+        self.zoom = 1.0                          # 思维导图的缩放（滚轮改）
+        self.collapsed = set()                   # 思维导图里被收起来的节点（存 id）
         self._block_nodes = {}                   # 画布图元 -> 节点
+        self._block_rects = {}                   # 节点 id -> 它那块的位置（高亮用）
+        self._highlight = None                   # 鼠标压住的那块的高亮框
         self._hover_node = None
         self._render_job = None
+        self._fonts = {}
         self.tip = HoverTip(gui.root, (FONT, 9), pad=(self.px(8), self.px(4)))
 
         self.win = tk.Toplevel(gui.root)
@@ -724,7 +735,7 @@ class StructureWindow:
 
         tk.Label(bar, text="小于", font=(FONT, 9), fg=Palette.text_muted,
                  bg=Palette.surface).pack(side='left', padx=(self.px(14), 0))
-        tk.Spinbox(bar, from_=0, to=50, increment=0.1, width=4, textvariable=self.min_share,
+        tk.Spinbox(bar, from_=self.MIN_SHARE, to=50, increment=0.1, width=4, textvariable=self.min_share,
             command=self._render, font=(FONT, 9), justify='center',
             relief='flat', bg=Palette.surface_alt, fg=Palette.text,
             buttonbackground=Palette.surface_alt, highlightthickness=1,
@@ -745,23 +756,35 @@ class StructureWindow:
             highlightthickness=1, highlightbackground=Palette.border)
         card.pack(fill='both', expand=True)
 
-        self.canvas = tk.Canvas(card, bg=Palette.surface, highlightthickness=0, bd=0,
-            yscrollcommand=self._on_yscroll, xscrollcommand=self._on_xscroll)
-        self.scroll_y = CleanScrollbar(card, orient='vertical', command=self.canvas.yview)
-        self.scroll_x = CleanScrollbar(card, orient='horizontal', command=self.canvas.xview)
-        self.canvas.pack(side='left', fill='both', expand=True)
+        self.canvas = tk.Canvas(card, bg=Palette.surface, highlightthickness=0, bd=0)
+        self.canvas.pack(fill='both', expand=True)
         self.canvas.bind('<Configure>', lambda _event: self._render_soon())
         self.canvas.bind('<Motion>', self._on_motion)
-        self.canvas.bind('<Leave>', lambda _event: self.tip.cancel())
+        self.canvas.bind('<Leave>', self._on_leave)
         self.canvas.bind('<Button-1>', self._on_click)
-        self.canvas.bind('<Button-3>', lambda _event: self.go_back())
+        self.canvas.bind('<Double-Button-1>', self._on_double_click)
+        self.canvas.bind('<MouseWheel>', self._on_wheel)
+        self.canvas.bind('<Button-2>', self._pan_start)        # 中键按住 = 拖画布
+        self.canvas.bind('<B2-Motion>', self._pan_move)
+        self.canvas.bind('<Button-3>', self._on_right_press)   # 右键：方块图=退回，导图=拖画布
+        self.canvas.bind('<B3-Motion>', self._pan_move)
 
-        tk.Label(self.win,
-            text="点一块 = 钻进去看它里面 · 右键或“返回上一层”退回 · 鼠标停住看完整路径",
-            font=(FONT, 9), fg=Palette.text_soft, bg=Palette.app_bg,
-            padx=self.px(18), pady=self.px(8)).pack(fill='x')
+        self.hint_label = tk.Label(self.win, text="", font=(FONT, 9),
+            fg=Palette.text_soft, bg=Palette.app_bg,
+            padx=self.px(18), pady=self.px(8))
+        self.hint_label.pack(fill='x')
 
         self._refresh_mode_buttons()
+        self._refresh_hint()
+
+    def _refresh_hint(self):
+        """底下那行提示分模式说 —— 两个模式的手势不一样，混着写谁也看不懂。"""
+        if self.mode.get() == 'treemap':
+            text = "点一块 = 钻进去看它里面 · 右键 = 退回上一层 · 鼠标停住看完整路径"
+        else:
+            text = ("双击一块 = 钻进去 · 点左边小三角 = 收起／展开它下面 · "
+                    "中键或右键按住拖动 = 移画布 · 滚轮 = 缩放")
+        self.hint_label.config(text=text)
 
     def _refresh_mode_buttons(self):
         for name, label in (('treemap', "方块图"), ('mindmap', "思维导图")):
@@ -772,6 +795,7 @@ class StructureWindow:
         if mode != self.mode.get():
             self.mode.set(mode)
             self._refresh_mode_buttons()
+            self._refresh_hint()
             self._render()
 
     def go_back(self):
@@ -793,12 +817,16 @@ class StructureWindow:
         return str(Path(base).joinpath(*parts)) if parts else base
 
     def min_size(self) -> float:
-        """小于这个字节数的就不画（旋钮是百分比）。"""
+        """小于这个字节数的就不画（旋钮填的是百分比）。
+
+        最低压到 0.05%：再往下就是几千块细条，看不清也不好看。
+        """
         try:
             share = float(self.min_share.get())
         except (tk.TclError, ValueError):
-            share = 0.0
-        return max(0.0, self.current().size * share / 100.0)
+            share = self.MIN_SHARE
+        share = min(50.0, max(self.MIN_SHARE, share))
+        return self.current().size * share / 100.0
 
     def levels(self) -> int:
         try:
@@ -818,8 +846,10 @@ class StructureWindow:
             return
         self.tip.cancel()
         self._hover_node = None
+        self._highlight = None
         self.canvas.delete('all')
         self._block_nodes.clear()
+        self._block_rects.clear()
         node = self.current()
         self.where_label.config(text=elide_middle(self.path_of(node), 72))
         self.back_btn.config(state='normal' if len(self.stack) > 1 else 'disabled')
@@ -827,6 +857,17 @@ class StructureWindow:
             self._render_treemap(node)
         else:
             self._render_mindmap(node)
+            # 导图是把根节点摆在整张图正中，图一高就跑到屏幕外了 —— 手动把它挪到画面中间
+            self._center_on(node)
+
+    def _center_on(self, node):
+        """把某个方块挪到画面正中：开图、钻进去的时候，先让人看见自己在哪。"""
+        rect = self._block_rects.get(id(node))
+        if rect is None:
+            return
+        x, y, width, height = rect
+        self._scroll_to(x + width / 2.0 - self.canvas.winfo_width() / 2.0,
+                        y + height / 2.0 - self.canvas.winfo_height() / 2.0)
 
     def _canvas_size(self):
         return self.canvas.winfo_width(), self.canvas.winfo_height()
@@ -836,45 +877,74 @@ class StructureWindow:
         if width < 40 or height < 40:
             self._render_soon()
             return
-        limit = self.min_size()
-        boxes = squarify([(child, child.size) for child in node.children if child.size >= limit],
-                         0.0, 0.0, float(width), float(height))
+        boxes = squarify(self._children_to_draw(node), 0.0, 0.0, float(width), float(height))
         for index, (child, bx, by, bw, bh) in enumerate(boxes):
-            self._draw_treemap_block(child, bx, by, bw, bh, 1, index % len(self.FAMILIES), limit)
+            self._draw_treemap_block(child, bx, by, bw, bh, 1, index % len(self.FAMILIES))
         self.canvas.configure(scrollregion=(0, 0, width, height))
 
-    def _draw_treemap_block(self, node, x, y, width, height, level, family, limit):
+    def _children_to_draw(self, node):
+        """这个文件夹里"值得画"的孩子：太小的不画，画了也就是一条缝。"""
+        limit = self.min_size()
+        return [(child, child.size) for child in node.children if child.size >= limit]
+
+    def _draw_treemap_block(self, node, x, y, width, height, level, family):
+        """画一块，再把它里面接着分下去。
+
+        给进来的 (x, y, width, height) 是"这块地方"，真画的方块往里缩一圈 ——
+        缩出来的缝就是两块之间的白线：有缝才看得出这儿是两块，不然糊成一片。
+        """
+        gap = self.px(self.GAP) / 2.0
+        x, y = x + gap, y + gap
+        width, height = width - gap * 2, height - gap * 2
         if width < self.MIN_BLOCK_PX or height < self.MIN_BLOCK_PX:
             return
         rect = self.canvas.create_rectangle(x, y, x + width, y + height,
-            fill=self._fill_color(node, level, family), outline=Palette.surface, width=1)
+            fill=self._fill_color(node, level, family), outline='', width=0)
         self._block_nodes[rect] = node
+        self._block_rects[id(node)] = (x, y, width, height)
+        self._draw_treemap_label(node, x, y, width, height)
         header = self.px(self.HEADER_PX)
-        label = f"{node.name}  {format_size(node.size)}"
-        if width > self.px(52) and height > self.px(13):
-            self.canvas.create_text(x + self.px(4), y + self.px(2), anchor='nw',
-                text=self._fit(label, width - self.px(8)),
-                font=(FONT, 8), fill=self._text_color(node, level))
         can_go_deeper = (node.is_dir and node.children
                          and level < self.levels() and height > header * 2)
         if not can_go_deeper:
             return
-        inner = squarify([(child, child.size) for child in node.children if child.size >= limit],
-                         x, y + header, max(0.0, width), max(0.0, height - header))
+        inner = squarify(self._children_to_draw(node), x, y + header,
+                         max(0.0, width), max(0.0, height - header))
         for child, bx, by, bw, bh in inner:
-            self._draw_treemap_block(child, bx, by, bw, bh, level + 1, family, limit)
+            self._draw_treemap_block(child, bx, by, bw, bh, level + 1, family)
+
+    def _draw_treemap_label(self, node, x, y, width, height):
+        """方块上写名儿。
+
+        地方小就不写 —— 硬写上去就是一堆 "steamap"、"Workbu"，比不写还乱。
+        地方大的（第一层那种大块）写大号字，再加一行"多大、占这里多少"。
+        """
+        if width < self.px(58) or height < self.px(16):
+            return
+        roomy = width >= self.px(150) and height >= self.px(46)
+        size = 11 if roomy else 8
+        self.canvas.create_text(x + self.px(7), y + self.px(5), anchor='nw',
+            text=self._fit(node.name, width - self.px(14), size, bold=roomy),
+            font=self._font(size, bold=roomy), fill=Palette.text)
+        if roomy:
+            share = node.size / max(1, self.current().size) * 100.0
+            self.canvas.create_text(x + self.px(7), y + self.px(26), anchor='nw',
+                text=f"{format_size(node.size)}  ·  占这里 {share:.1f}%",
+                font=self._font(9), fill=Palette.text_muted)
 
     def _render_mindmap(self, node):
         width, height = self._canvas_size()
         if width < 40 or height < 40:
             self._render_soon()
             return
-        col = self.px(self.COLUMN_WIDTH)
-        box_w = col - self.px(26)
-        box_h = self.px(self.ROW_HEIGHT) - self.px(6)
-        rows = mindmap_rows(node, self.levels(), self.min_size(), float(self.px(self.ROW_HEIGHT)))
-        places = {id(item): (self.px(18) + level * col, cy)
-                  for item, level, cy in rows}
+        limit = self.min_size()
+        zoom = self.zoom
+        col = max(56.0, self.px(self.COLUMN_WIDTH) * zoom)      # 一层占多宽
+        row = max(11.0, self.px(self.ROW_HEIGHT) * zoom)        # 一行多高
+        box_w = max(30.0, col - self.px(26) * zoom)
+        box_h = max(7.0, row - self.px(6) * zoom)
+        rows = mindmap_rows(node, self.levels(), limit, row, self.collapsed)
+        places = {id(item): (self.px(18) + level * col, cy) for item, level, cy in rows}
         families = {id(node): 0}
         counter = 0
         for item, level, _cy in rows:                    # 先定颜色：一支一个色，深的沿用父的
@@ -886,29 +956,94 @@ class StructureWindow:
                     counter += 1
                 else:
                     families[id(child)] = families.get(id(item), 0)
-        for item, level, _cy in rows:                    # 连线画在方块底下
+        for item, _level, _cy in rows:                   # 连线画在方块底下
             x, y = places[id(item)]
             for child in item.children:
                 if id(child) not in places:
                     continue
                 cx, cy = places[id(child)]
                 mid = (x + box_w + cx) / 2.0
-                thick = max(1, int(min(6, (child.size / max(1, node.size)) * 40)))
+                thick = max(1, int(min(6.0, max(1.5, zoom * 2.2),
+                                       (child.size / max(1, node.size)) * 40)))
                 self.canvas.create_line(x + box_w, y, mid, y, mid, cy, cx, cy,
                     fill='#C7CDD6', width=thick, joinstyle='miter')
+        text_size = max(7, int(8 * zoom))
         for item, level, _cy in rows:
             x, y = places[id(item)]
-            family = families.get(id(item), 0)
-            rect = self.canvas.create_rectangle(x, y - box_h / 2.0, x + box_w, y + box_h / 2.0,
-                fill=self._fill_color(item, level, family), outline=Palette.surface, width=1)
+            top = y - box_h / 2.0
+            rect = self.canvas.create_rectangle(x, top, x + box_w, y + box_h / 2.0,
+                fill=self._fill_color(item, level, families.get(id(item), 0)),
+                outline='', width=0)
             self._block_nodes[rect] = item
-            label = f"{item.name}  {format_size(item.size)}"
-            if item.is_dir:
-                label = "📁 " + label
-            self.canvas.create_text(x + self.px(6), y, anchor='w',
-                text=self._fit(label, box_w - self.px(12)),
-                font=(FONT, 8), fill=self._text_color(item, level))
+            self._block_rects[id(item)] = (x, top, box_w, box_h)
+            if level < self.levels() and any(child.size >= limit for child in item.children):
+                marker = '▸' if id(item) in self.collapsed else '▾'
+                tag = f"toggle{id(item)}"
+                self.canvas.create_text(x - max(6.0, self.px(9) * zoom), y, text=marker,
+                    font=self._font(max(8, int(9 * zoom)), bold=True),
+                    fill=Palette.text_muted, tags=(tag,))
+                self.canvas.tag_bind(tag, '<Button-1>',
+                    lambda _event, target=item: self.toggle_collapse(target))
+            if zoom >= 0.55:                  # 缩得太小就别写字了，写了也是糊的
+                label = ("📁 " if item.is_dir else "") + f"{item.name}  {format_size(item.size)}"
+                self.canvas.create_text(x + self.px(7), y, anchor='w',
+                    text=self._fit(label, box_w - self.px(14), text_size),
+                    font=self._font(text_size), fill=Palette.text)
         self.canvas.configure(scrollregion=self.canvas.bbox('all') or (0, 0, width, height))
+
+    def toggle_collapse(self, node):
+        """收起／展开一个节点的子元素（导图里点它左边那个小三角）。"""
+        key = id(node)
+        if key in self.collapsed:
+            self.collapsed.discard(key)
+        else:
+            self.collapsed.add(key)
+        self._render()
+
+    # ---------- 缩放 / 拖画布 ----------
+
+    def _pan_start(self, event):
+        self.canvas.scan_mark(event.x, event.y)
+
+    def _pan_move(self, event):
+        self.canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def _on_right_press(self, event):
+        """右键：方块图里是"退回上一层"，思维导图里是"按住拖画布"。"""
+        if self.mode.get() == 'treemap':
+            self.go_back()
+        else:
+            self._pan_start(event)
+
+    def _on_wheel(self, event):
+        """滚轮缩放。
+
+        缩的时候，光标底下那个点得待在原地 —— 不然一缩就找不着刚才盯着的地方了。
+        """
+        if self.mode.get() != 'mindmap':
+            return                        # 方块图本来就铺满一屏，没什么可缩的
+        factor = self.ZOOM_STEP if event.delta > 0 else 1.0 / self.ZOOM_STEP
+        new_zoom = min(self.MAX_ZOOM, max(self.MIN_ZOOM, self.zoom * factor))
+        if abs(new_zoom - self.zoom) < 1e-6:
+            return
+        anchor_x = self.canvas.canvasx(event.x)
+        anchor_y = self.canvas.canvasy(event.y)
+        ratio = new_zoom / self.zoom
+        self.zoom = new_zoom
+        self._render()
+        self.canvas.update_idletasks()
+        self._scroll_to(anchor_x * ratio - event.x, anchor_y * ratio - event.y)
+
+    def _scroll_to(self, x, y):
+        """把画布挪到某个位置（用比例挪，画布就这么干的）。"""
+        try:
+            x0, y0, x1, y1 = (float(v) for v in str(self.canvas.cget('scrollregion')).split())
+        except ValueError:
+            return
+        total_x = max(1.0, x1 - x0)
+        total_y = max(1.0, y1 - y0)
+        self.canvas.xview_moveto(min(1.0, max(0.0, (x - x0) / total_x)))
+        self.canvas.yview_moveto(min(1.0, max(0.0, (y - y0) / total_y)))
 
     def _shade(self, level, family):
         tones = self.FAMILIES[family % len(self.FAMILIES)]
@@ -920,19 +1055,24 @@ class StructureWindow:
             return self.FAMILIES[family % len(self.FAMILIES)][2]
         return self._shade(level, family)
 
-    def _text_color(self, node, level):
-        if not node.is_dir:
-            return Palette.text
-        return '#FFFFFF' if level <= 1 else Palette.text
+    def _font(self, size, bold=False):
+        key = (int(size), bool(bold))
+        font = self._fonts.get(key)
+        if font is None:
+            font = tkfont.Font(family=FONT, size=int(size),
+                               weight='bold' if bold else 'normal')
+            self._fonts[key] = font
+        return font
 
-    def _fit(self, text, max_px):
+    def _fit(self, text, max_px, size=8, bold=False):
         """太长就掐成"xxxx…"：按像素算的，不是按字数。"""
         if max_px <= 0:
             return ''
-        if self.font.measure(text) <= max_px:
+        font = self._font(size, bold)
+        if font.measure(text) <= max_px:
             return text
         out = text
-        while out and self.font.measure(out + '…') > max_px:
+        while out and font.measure(out + '…') > max_px:
             out = out[:-1]
         return out + '…'
 
@@ -952,32 +1092,48 @@ class StructureWindow:
             return
         self._hover_node = node
         self.tip.cancel()
+        self._highlight_block(node)
         if node is None:
             return
         share = node.size / max(1, self.current().size) * 100.0
         self.tip.schedule(f"{elide_middle(self.path_of(node), 80)}\n"
                           f"{format_size(node.size)}  ·  占这里 {share:.1f}%")
 
+    def _highlight_block(self, node):
+        """鼠标压住哪块，就给哪块描个蓝边 —— 一眼知道现在指的是哪块。"""
+        if self._highlight is not None:
+            self.canvas.delete(self._highlight)
+            self._highlight = None
+        rect = self._block_rects.get(id(node)) if node is not None else None
+        if rect is None:
+            return
+        x, y, width, height = rect
+        self._highlight = self.canvas.create_rectangle(
+            x - 1, y - 1, x + width + 1, y + height + 1,
+            outline=Palette.accent, width=2)
+
+    def _on_leave(self, _event):
+        self.tip.cancel()
+        self._hover_node = None
+        self._highlight_block(None)
+
     def _on_click(self, event):
-        node = self._node_at(event.x, event.y)
+        """单击：方块图里就直接钻进去（那儿没有拖动，点一下不会误触）。"""
+        if self.mode.get() == 'treemap':
+            self._drill(self._node_at(event.x, event.y))
+
+    def _on_double_click(self, event):
+        """双击：思维导图里钻进去（那儿单击要留给"选一块看看"）。"""
+        if self.mode.get() == 'mindmap':
+            self._drill(self._node_at(event.x, event.y))
+
+    def _drill(self, node):
         if node is None or not node.is_dir or not node.children:
             return
         self.stack.append(node)
         self._render()
 
-    # ---------- 滚动条 / 关窗 ----------
-
-    def _on_yscroll(self, first, last):
-        self.scroll_y.set(first, last)
-        toggle_scrollbar(self.scroll_y, self.scroll_y.is_scrollable(), before=self.canvas,
-                         side='right', fill='y',
-                         padx=(0, self.px(2)), pady=self.px(2))
-
-    def _on_xscroll(self, first, last):
-        self.scroll_x.set(first, last)
-        toggle_scrollbar(self.scroll_x, self.scroll_x.is_scrollable(), before=self.canvas,
-                         side='bottom', fill='x',
-                         padx=self.px(2), pady=(0, self.px(2)))
+    # ---------- 关窗 ----------
 
     def close(self):
         self.tip.cancel()
