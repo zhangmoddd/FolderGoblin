@@ -17,6 +17,25 @@ from typing import Dict, List, Optional
 FONT = 'Microsoft YaHei UI'
 MONO = 'Consolas'
 
+# 读不到东西时，把系统给的错误码翻译成人话
+ERROR_LABELS = {
+    5: '没权限（系统文件夹之类）',
+    2: '扫描过程中被删掉了',
+    32: '被别的程序占着',
+    23: '磁盘这一块读不出来（坏道）',
+    1392: '文件系统结构坏了',
+    1393: '文件系统结构坏了',
+}
+ERROR_NAMES = {
+    5: '拒绝访问',
+    2: '文件已不存在',
+    32: '文件被占用',
+    23: '数据校验错',
+    1392: '文件或目录损坏',
+    1393: '磁盘结构损坏',
+}
+DAMAGE_CODES = {23, 1392, 1393}
+
 
 class Palette:
     """浅色主题配色：白底、灰边框、单一蓝色强调色。"""
@@ -76,6 +95,15 @@ class FileNode:
         return self.size
 
 
+def display_width(text: str) -> int:
+    """中文算两个格子，英文算一个 —— 排版对齐用"""
+    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in text)
+
+
+def pad_to(text: str, width: int) -> str:
+    return text + ' ' * max(1, width - display_width(text))
+
+
 def format_size(bytes_size: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB", "PB"]
     unit_idx = 0
@@ -105,6 +133,7 @@ class AnalysisThread:
         self.directories_scanned = 0
         self.bytes_scanned = 0
         self.errors = 0
+        self.error_kinds: Dict[int, int] = {}
         self.symlinks_skipped = 0
         self.max_depth = 0
         self.ext_stats: Dict[str, List[int]] = {}
@@ -134,6 +163,7 @@ class AnalysisThread:
             self.directories_scanned = 0
             self.bytes_scanned = 0
             self.errors = 0
+            self.error_kinds = {}
             self.symlinks_skipped = 0
             self.max_depth = 0
             self.ext_stats = {}
@@ -219,6 +249,7 @@ class AnalysisThread:
                 'directories': self.directories_scanned,
                 'bytes': self.bytes_scanned,
                 'errors': self.errors,
+                'error_kinds': dict(self.error_kinds),
                 'symlinks': self.symlinks_skipped,
                 'depth': self.max_depth,
                 'stats': self.ext_stats,
@@ -269,13 +300,21 @@ class AnalysisThread:
                                 bucket = self.ext_stats[ext] = [0, 0]
                             bucket[0] += 1
                             bucket[1] += size
-                    except (PermissionError, FileNotFoundError, OSError):
-                        self.errors += 1
-        except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
-            self.errors += 1
+                    except OSError as exc:
+                        self._record_error(exc)
+        except OSError as exc:
+            self._record_error(exc)
 
         node.children.sort(key=lambda child: child.size, reverse=True)
         return node
+
+    def _record_error(self, exc):
+        """记一笔读不到的东西，顺便按错误码分类 —— 好让界面说清楚是"没权限"还是"盘坏了"。"""
+        self.errors += 1
+        code = getattr(exc, 'winerror', None)
+        if code is None:
+            code = getattr(exc, 'errno', None) or 0
+        self.error_kinds[code] = self.error_kinds.get(code, 0) + 1
 
     def drain_events(self, limit: int = 200):
         drained = []
@@ -599,7 +638,7 @@ class FolderSizeGUI:
         tk.Label(uncounted_head, text="除下列项外，全部算进去了", font=(FONT, 9),
             fg=Palette.text_muted, bg=Palette.surface).pack(side='right')
 
-        self.uncounted_text = tk.Text(stats_card, height=3,
+        self.uncounted_text = tk.Text(stats_card, height=5,
             bg=Palette.surface, fg=Palette.text,
             font=(MONO, 9),
             relief='flat', bd=0, highlightthickness=0,
@@ -609,6 +648,7 @@ class FolderSizeGUI:
         self.uncounted_text.tag_configure('name', foreground=Palette.text)
         self.uncounted_text.tag_configure('num', foreground=Palette.text_muted)
         self.uncounted_text.tag_configure('dim', foreground=Palette.text_soft)
+        self.uncounted_text.tag_configure('warn', foreground=Palette.danger)
 
         # 左侧目录树
         tree_card = tk.Frame(content, bg=Palette.surface,
@@ -1036,9 +1076,15 @@ class FolderSizeGUI:
         self.depth_label.config(text=str(event.get('depth', 0)))
         self._render_stats(event.get('stats') or {})
         status = "已停止" if event['cancelled'] else "扫描完成"
-        error_text = f"  ·  读取失败 {event['errors']} 项" if event['errors'] else ""
-        self.scan_label.config(text=f"{status}  ·  {event['files']:,} 个文件{error_text}")
-        self._fill_uncounted(event.get('symlinks', 0), event['errors'])
+        bits = [status, f"{event['files']:,} 个文件"]
+        if event['errors']:
+            kinds = event.get('error_kinds') or {}
+            damaged = sum(n for code, n in kinds.items() if code in DAMAGE_CODES)
+            bits.append(f"{event['errors']} 项读不到")
+            if damaged:
+                bits.append(f"其中 {damaged} 项是文件系统损坏")
+        self.scan_label.config(text="  ·  ".join(bits))
+        self._fill_uncounted(event.get('symlinks', 0), event['errors'], event.get('error_kinds'))
         self._stopping = False
         self._scanning = False
 
@@ -1061,21 +1107,28 @@ class FolderSizeGUI:
             self.stats_text.insert('end', f"{format_size(size):>10}\n", 'num')
         self.stats_text.config(state='disabled')
 
-    def _fill_uncounted(self, symlinks, errors):
-        """只列真正没算进总数里的东西 —— 现在除了符号链接和读不到的，一个不落。"""
+    def _fill_uncounted(self, symlinks, errors, error_kinds=None):
+        """只列真正没算进总数里的东西，并说清楚是"没权限"还是"盘坏了"。"""
         self.uncounted_text.config(state='normal')
         self.uncounted_text.delete(1.0, 'end')
+        kinds = error_kinds or {}
+        top = sorted(kinds.items(), key=lambda kv: -kv[1])[:3]
         if not symlinks and not errors:
             self.uncounted_text.insert('end', "无 —— 所有文件都算进去了\n", 'dim')
         else:
             if symlinks:
-                self.uncounted_text.insert('end', f"{'符号链接':<10}", 'name')
-                self.uncounted_text.insert('end', f"{symlinks:>8,} 个", 'num')
-                self.uncounted_text.insert('end', "   不跟随，防止绕圈\n", 'dim')
-            if errors:
-                self.uncounted_text.insert('end', f"{'读取失败':<10}", 'name')
-                self.uncounted_text.insert('end', f"{errors:>8,} 项", 'num')
-                self.uncounted_text.insert('end', "   没权限或被占用\n", 'dim')
+                self.uncounted_text.insert('end', pad_to('符号链接', 15), 'name')
+                self.uncounted_text.insert('end', f"{symlinks:>6,} 个", 'num')
+                self.uncounted_text.insert('end', "   不跟进去，防止绕圈\n", 'dim')
+            for code, count in top:
+                name = ERROR_NAMES.get(code, f'其他错误 {code}')
+                why = ERROR_LABELS.get(code, '')
+                self.uncounted_text.insert('end', pad_to(name, 15), 'name')
+                self.uncounted_text.insert('end', f"{count:>6,} 项", 'num')
+                tag = 'warn' if code in DAMAGE_CODES else 'dim'
+                self.uncounted_text.insert('end', f"   {why}\n", tag)
+            if len(kinds) > len(top):
+                self.uncounted_text.insert('end', f"还有 {len(kinds) - len(top)} 类其他错误\n", 'dim')
         self.uncounted_text.config(state='disabled')
 
     def _adopt_final_tree(self, root):
