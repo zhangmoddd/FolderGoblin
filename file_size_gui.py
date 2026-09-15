@@ -1,19 +1,64 @@
 #!/usr/bin/env python3
 """
-文件夹大小分析器 - 霓虹风格 GUI (Treeview版本，修复滚动性能)
+文件夹大小分析器 - 现代浅色风格 GUI (Treeview版本，修复滚动性能)
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog
-import threading
+import ctypes
 import os
 import queue
+import threading
 import time
-from pathlib import Path
+import tkinter as tk
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Callable
+from pathlib import Path
+from tkinter import filedialog, ttk
+from typing import Dict, List, Optional
 
 IGNORE_DEFAULT = {"node_modules", ".git", "__pycache__", ".vscode", "bin", "obj", ".idea", "dist", "build"}
+
+FONT = 'Microsoft YaHei UI'
+MONO = 'Consolas'
+
+
+class Palette:
+    """浅色主题配色：白底、灰边框、单一蓝色强调色。"""
+    app_bg = '#F3F4F6'        # 窗口底色
+    surface = '#FFFFFF'       # 卡片 / 面板底色
+    surface_alt = '#F9FAFB'   # 次级底色（表头）
+    border = '#E5E7EB'        # 分隔线、边框
+    text = '#111827'          # 主文字
+    text_muted = '#6B7280'    # 次要文字
+    text_soft = '#9CA3AF'     # 更淡的辅助文字
+    accent = '#2563EB'        # 强调色（蓝）
+    accent_dark = '#1D4ED8'   # 强调色按下
+    accent_soft = '#EFF6FF'   # 强调色浅底（悬停）
+    danger = '#DC2626'
+    danger_soft = '#FEF2F2'
+    selection = '#DBEAFE'     # 选中行底色
+
+
+def enable_dpi_awareness() -> bool:
+    """让 Windows 按真实分辨率渲染，文字不糊。"""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        return True
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+        return True
+    except Exception:
+        return False
+
+
+def get_scale_factor() -> float:
+    try:
+        factor = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
+        if 0.5 <= factor <= 4.0:
+            return factor
+    except Exception:
+        pass
+    return 1.0
 
 
 @dataclass
@@ -213,26 +258,26 @@ class AnalysisThread:
         self._pause_event.set()
 
 
-class NeonGUI:
+class FolderSizeGUI:
     def __init__(self):
+        self.dpi_ok = enable_dpi_awareness()
+        self.scale = get_scale_factor() if self.dpi_ok else 1.0
+
         self.root = tk.Tk()
         self.root.title("文件夹大小分析器")
-        self.root.geometry("1400x900")
-        self.root.configure(bg='#0a0a0f')
+        if self.dpi_ok:
+            self.root.tk.call('tk', 'scaling', self.scale * 96.0 / 72.0)
+        self.root.configure(bg=Palette.app_bg)
+        self.root.geometry(f"{self.px(1180)}x{self.px(780)}")
+        self.root.minsize(self.px(900), self.px(560))
+        self._center_window()
 
-        self.bg_dark = '#0a0a0f'
-        self.bg_surface = '#12121a'
-        self.bg_elevated = '#1a1a24'
-        self.neon_cyan = '#00f5ff'
-        self.neon_magenta = '#ff00aa'
-        self.neon_lime = '#b8ff00'
-        self.neon_orange = '#ff6b35'
-        self.text_primary = '#ffffff'
-        self.text_secondary = '#8a8a9a'
+        self.row_height = self.px(28)
 
         self.analysis = AnalysisThread()
         self.current_root = None
         self.analyzed_path = None
+        self.total_bytes = 0
         self.item_to_node: Dict[str, FileNode] = {}
         self.path_to_item = {}
         self.item_to_path = {}
@@ -244,153 +289,129 @@ class NeonGUI:
         self.create_widgets()
         self.create_context_menu()
 
+    # ---------- 尺寸 / 样式基础 ----------
+
+    def px(self, value: int) -> int:
+        return max(1, int(round(value * self.scale)))
+
+    def _center_window(self):
+        self.root.update_idletasks()
+        width = self.px(1180)
+        height = self.px(780)
+        x = max(0, (self.root.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.root.winfo_screenheight() - height) // 3)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
     def setup_styles(self):
         style = ttk.Style()
         style.theme_use('clam')
-        style.configure('Neon.TFrame', background=self.bg_surface)
-        style.configure('Neon.Treeview',
-            background=self.bg_surface,
-            foreground=self.text_primary,
-            fieldbackground=self.bg_surface,
-            bordercolor=self.neon_cyan,
-            rowheight=34,
-            font=('Microsoft YaHei UI', 12)
+
+        style.configure('Clean.Treeview',
+            background=Palette.surface,
+            fieldbackground=Palette.surface,
+            foreground=Palette.text,
+            borderwidth=0,
+            relief='flat',
+            rowheight=self.row_height,
+            font=(FONT, 10),
         )
-        style.configure('Neon.Treeview.Heading',
-            background=self.bg_elevated,
-            foreground=self.neon_cyan,
-            font=('Microsoft YaHei UI', 12, 'bold')
+        style.layout('Clean.Treeview', [('Treeview.treearea', {'sticky': 'nswe'})])
+        style.map('Clean.Treeview',
+            background=[('selected', Palette.selection)],
+            foreground=[('selected', Palette.text)],
         )
+
+        style.configure('Clean.Treeview.Heading',
+            background=Palette.surface_alt,
+            foreground=Palette.text_muted,
+            relief='flat',
+            borderwidth=0,
+            padding=(self.px(8), self.px(7)),
+            font=(FONT, 9),
+        )
+        style.map('Clean.Treeview.Heading',
+            background=[('active', Palette.surface_alt)],
+            relief=[('active', 'flat')],
+        )
+
+        for orient in ('Vertical', 'Horizontal'):
+            name = f'Clean.{orient}.TScrollbar'
+            style.configure(name,
+                background='#C1C7CE',
+                troughcolor=Palette.surface,
+                bordercolor=Palette.surface,
+                darkcolor=Palette.surface,
+                lightcolor=Palette.surface,
+                arrowcolor=Palette.surface,
+                borderwidth=0,
+                arrowsize=self.px(10),
+                width=self.px(10),
+            )
+            style.map(name, background=[('active', '#98A0AA')])
+
+        style.configure('Clean.Horizontal.TProgressbar',
+            background=Palette.accent,
+            troughcolor=Palette.border,
+            bordercolor=Palette.border,
+            darkcolor=Palette.accent,
+            lightcolor=Palette.accent,
+            borderwidth=0,
+            thickness=self.px(4),
+        )
+
+    def _button(self, parent, text, command, kind='secondary'):
+        specs = {
+            'primary': (Palette.accent, '#FFFFFF', Palette.accent_dark, 0),
+            'secondary': (Palette.surface, Palette.text, Palette.surface_alt, 1),
+            'danger': (Palette.surface, Palette.danger, Palette.danger_soft, 1),
+            'ghost': (Palette.surface, Palette.accent, Palette.accent_soft, 0),
+        }
+        bg, fg, hover, border = specs[kind]
+        btn = tk.Button(parent, text=text, command=command,
+            bg=bg, fg=fg,
+            activebackground=hover, activeforeground=fg,
+            disabledforeground=Palette.text_muted,
+            font=(FONT, 10, 'bold' if kind == 'primary' else 'normal'),
+            relief='flat', bd=0,
+            highlightthickness=border,
+            highlightbackground=Palette.border,
+            highlightcolor=Palette.border,
+            padx=self.px(16 if kind == 'primary' else 12),
+            pady=self.px(7 if kind == 'primary' else 6),
+            cursor='hand2',
+        )
+
+        def on_enter(_event):
+            if str(btn['state']) != 'disabled':
+                btn.configure(bg=hover)
+
+        def on_leave(_event):
+            if str(btn['state']) != 'disabled':
+                btn.configure(bg=bg)
+
+        btn.bind('<Enter>', on_enter)
+        btn.bind('<Leave>', on_leave)
+        return btn
+
+    def _hline(self, parent, top=False):
+        line = tk.Frame(parent, bg=Palette.border, height=1)
+        if top:
+            line.pack(fill='x', side='top')
+        else:
+            line.pack(fill='x')
+        return line
+
+    # ---------- 界面搭建 ----------
 
     def create_widgets(self):
-        # Header
-        header = tk.Frame(self.root, bg=self.bg_surface, padx=25, pady=15)
-        header.pack(fill='x')
-        tk.Label(header, text="文件夹大小分析器",
-            font=('Microsoft YaHei UI', 22, 'bold'),
-            fg=self.neon_cyan, bg=self.bg_surface).pack(side='left')
+        self._build_header()
+        self._hline(self.root)
+        self._build_toolbar()
+        self._hline(self.root)
+        self._build_content()
+        self._hline(self.root, top=True)
+        self._build_statusbar()
 
-        # Stats bar
-        stats_frame = tk.Frame(self.root, bg=self.bg_surface, padx=25, pady=12)
-        stats_frame.pack(fill='x')
-        self.total_label = tk.Label(stats_frame, text="总大小: --",
-            font=('Microsoft YaHei UI', 14), fg=self.neon_lime, bg=self.bg_surface)
-        self.total_label.pack(side='left', padx=25)
-        self.count_label = tk.Label(stats_frame, text="文件/文件夹: --",
-            font=('Microsoft YaHei UI', 14), fg=self.neon_magenta, bg=self.bg_surface)
-        self.count_label.pack(side='left', padx=25)
-        self.depth_label = tk.Label(stats_frame, text="最大深度: --",
-            font=('Microsoft YaHei UI', 14), fg=self.neon_cyan, bg=self.bg_surface)
-        self.depth_label.pack(side='left', padx=25)
-        self.scan_label = tk.Label(stats_frame, text="",
-            font=('Microsoft YaHei UI', 12), fg=self.neon_orange, bg=self.bg_surface)
-        self.scan_label.pack(side='right', padx=10)
-
-        # Control bar
-        control_frame = tk.Frame(self.root, bg=self.bg_elevated, padx=25, pady=15)
-        control_frame.pack(fill='x')
-        self.browse_btn = tk.Button(control_frame, text="选择文件夹",
-            command=self.browse_folder,
-            bg=self.bg_elevated, fg=self.neon_cyan,
-            font=('Microsoft YaHei UI', 13, 'bold'),
-            relief='flat', bd=0, padx=20, pady=10,
-            cursor='hand2',
-            highlightthickness=1, highlightcolor=self.neon_cyan,
-            highlightbackground=self.bg_elevated)
-        self.browse_btn.pack(side='left', padx=5)
-        self.pause_btn = tk.Button(control_frame, text="暂停",
-            command=self.toggle_pause,
-            bg=self.neon_orange, fg=self.bg_dark,
-            font=('Microsoft YaHei UI', 13, 'bold'),
-            relief='flat', bd=0, padx=20, pady=10,
-            state='disabled', cursor='hand2')
-        self.pause_btn.pack(side='left', padx=5)
-        self.stop_btn = tk.Button(control_frame, text="停止",
-            command=self.stop_analysis,
-            bg='#e74c3c', fg=self.text_primary,
-            font=('Microsoft YaHei UI', 13, 'bold'),
-            relief='flat', bd=0, padx=20, pady=10,
-            state='disabled', cursor='hand2')
-        self.stop_btn.pack(side='left', padx=5)
-        self.expand_btn = tk.Button(control_frame, text="展开全部",
-            command=self.expand_all,
-            bg=self.bg_elevated, fg=self.neon_cyan,
-            font=('Microsoft YaHei UI', 12),
-            relief='flat', bd=0, padx=15, pady=8,
-            cursor='hand2')
-        self.expand_btn.pack(side='left', padx=20)
-        self.collapse_btn = tk.Button(control_frame, text="收起全部",
-            command=self.collapse_all,
-            bg=self.bg_elevated, fg=self.neon_cyan,
-            font=('Microsoft YaHei UI', 12),
-            relief='flat', bd=0, padx=15, pady=8,
-            cursor='hand2')
-        self.collapse_btn.pack(side='left', padx=5)
-
-        # Search box
-        search_frame = tk.Frame(control_frame, bg=self.bg_elevated)
-        search_frame.pack(side='right', padx=5)
-        tk.Label(search_frame, text="搜索:",
-            fg=self.text_secondary, bg=self.bg_elevated,
-            font=('Microsoft YaHei UI', 11)).pack(side='left', padx=(10, 5))
-        self.search_entry = tk.Entry(search_frame,
-            bg=self.bg_dark, fg=self.text_primary,
-            font=('Microsoft YaHei UI', 12),
-            insertbackground=self.neon_cyan,
-            relief='flat', bd=0, width=20)
-        self.search_entry.pack(side='left', padx=5)
-        self.search_entry.bind('<KeyRelease>', lambda e: self.apply_search())
-        tk.Button(search_frame, text="清除",
-            command=self.clear_search,
-            bg=self.bg_dark, fg=self.neon_cyan,
-            font=('Microsoft YaHei UI', 10),
-            relief='flat', bd=0, padx=10, pady=4,
-            cursor='hand2').pack(side='left', padx=5)
-
-        self.progress = ttk.Progressbar(control_frame, mode='indeterminate', length=200)
-
-        # Main content
-        content = tk.Frame(self.root, bg=self.bg_dark, padx=20, pady=15)
-        content.pack(fill='both', expand=True)
-
-        # Tree view with virtual scrolling
-        tree_frame = tk.Frame(content, bg=self.bg_surface)
-        tree_frame.pack(side='left', fill='both', expand=True)
-
-        scroll_y = ttk.Scrollbar(tree_frame, orient='vertical')
-        scroll_y.pack(side='right', fill='y')
-        scroll_x = ttk.Scrollbar(tree_frame, orient='horizontal')
-        scroll_x.pack(side='bottom', fill='x')
-
-        self.tree = ttk.Treeview(tree_frame,
-            style='Neon.Treeview',
-            yscrollcommand=scroll_y.set,
-            xscrollcommand=scroll_x.set)
-        self.tree.pack(fill='both', expand=True)
-        scroll_y.config(command=self.tree.yview)
-        scroll_x.config(command=self.tree.xview)
-
-        self.tree.tag_configure('folder', foreground=self.neon_cyan, font=('Microsoft YaHei UI', 12, 'bold'))
-        self.tree.tag_configure('file', foreground=self.text_primary, font=('Microsoft YaHei UI', 11))
-        self.tree.tag_configure('big', foreground=self.neon_lime, font=('Microsoft YaHei UI', 13, 'bold'))
-
-        # Stats panel
-        stats_panel = tk.Frame(content, bg=self.bg_surface, width=300)
-        stats_panel.pack(side='right', fill='y', padx=(10, 0))
-        stats_panel.pack_propagate(False)
-        tk.Label(stats_panel, text="文件类型统计",
-            font=('Microsoft YaHei UI', 14, 'bold'),
-            fg=self.neon_cyan, bg=self.bg_surface).pack(pady=(10, 15))
-        self.stats_text = tk.Text(stats_panel,
-            bg=self.bg_surface, fg=self.text_primary,
-            font=('Consolas', 12),
-            relief='flat', bd=0,
-            state='disabled', wrap='none')
-        self.stats_text.pack(fill='both', expand=True, padx=10, pady=(0, 10))
-
-        self.tree.bind("<Button-3>", self.show_context_menu)
-
-        # Keyboard shortcuts
         self.root.bind('<Control-o>', lambda e: self.browse_folder())
         self.root.bind('<Control-O>', lambda e: self.browse_folder())
         self.root.bind('<Escape>', lambda e: self.stop_analysis() if self.analysis.running else None)
@@ -402,10 +423,163 @@ class NeonGUI:
         self.root.bind('<Control-F>', lambda e: self.focus_search())
         self.root.bind('<Return>', lambda e: self.apply_search())
 
+    def _build_header(self):
+        header = tk.Frame(self.root, bg=Palette.surface,
+                          padx=self.px(20), pady=self.px(14))
+        header.pack(fill='x')
+
+        tk.Label(header, text="文件夹大小分析器",
+            font=(FONT, 15, 'bold'),
+            fg=Palette.text, bg=Palette.surface).pack(side='left')
+
+        stats = tk.Frame(header, bg=Palette.surface)
+        stats.pack(side='right')
+        # 从右往左 pack，最终显示顺序：总大小 / 项目数 / 最大深度
+        self.depth_label = self._stat(stats, "最大深度", Palette.text)
+        self.count_label = self._stat(stats, "项目数", Palette.text)
+        self.total_label = self._stat(stats, "总大小", Palette.accent)
+
+    def _stat(self, parent, title, value_color):
+        box = tk.Frame(parent, bg=Palette.surface)
+        box.pack(side='right', padx=(self.px(22), 0))
+        tk.Label(box, text=title, font=(FONT, 9),
+            fg=Palette.text_muted, bg=Palette.surface).pack(anchor='e')
+        value = tk.Label(box, text="--", font=(FONT, 12, 'bold'),
+            fg=value_color, bg=Palette.surface)
+        value.pack(anchor='e')
+        return value
+
+    def _build_toolbar(self):
+        bar = tk.Frame(self.root, bg=Palette.surface,
+                       padx=self.px(20), pady=self.px(10))
+        bar.pack(fill='x')
+
+        self.browse_btn = self._button(bar, "选择文件夹", self.browse_folder, 'primary')
+        self.browse_btn.pack(side='left')
+        self.pause_btn = self._button(bar, "暂停", self.toggle_pause, 'secondary')
+        self.pause_btn.pack(side='left', padx=(self.px(8), 0))
+        self.stop_btn = self._button(bar, "停止", self.stop_analysis, 'danger')
+        self.stop_btn.pack(side='left', padx=(self.px(8), 0))
+        self.pause_btn.config(state='disabled')
+        self.stop_btn.config(state='disabled')
+
+        tk.Frame(bar, bg=Palette.border, width=1).pack(
+            side='left', fill='y', padx=self.px(14), pady=self.px(2))
+
+        self.expand_btn = self._button(bar, "展开全部", self.expand_all, 'ghost')
+        self.expand_btn.pack(side='left')
+        self.collapse_btn = self._button(bar, "收起全部", self.collapse_all, 'ghost')
+        self.collapse_btn.pack(side='left', padx=(self.px(4), 0))
+
+        search = tk.Frame(bar, bg=Palette.surface)
+        search.pack(side='right')
+        self.clear_btn = self._button(search, "清除", self.clear_search, 'ghost')
+        self.clear_btn.pack(side='right', padx=(self.px(6), 0))
+
+        entry_box = tk.Frame(search, bg=Palette.surface,
+            highlightthickness=1, highlightbackground=Palette.border,
+            highlightcolor=Palette.border)
+        entry_box.pack(side='right')
+        tk.Label(entry_box, text="搜索", font=(FONT, 9),
+            fg=Palette.text_muted, bg=Palette.surface).pack(
+            side='left', padx=(self.px(8), self.px(4)), pady=self.px(5))
+        self.search_entry = tk.Entry(entry_box,
+            bg=Palette.surface, fg=Palette.text,
+            disabledbackground=Palette.surface,
+            font=(FONT, 10), width=18,
+            insertbackground=Palette.text,
+            relief='flat', bd=0,
+            highlightthickness=0)
+        self.search_entry.pack(side='left', padx=(0, self.px(8)), pady=self.px(5))
+        self.search_entry.bind('<KeyRelease>', lambda e: self.apply_search())
+
+    def _build_content(self):
+        content = tk.Frame(self.root, bg=Palette.app_bg,
+                           padx=self.px(16), pady=self.px(14))
+        content.pack(fill='both', expand=True)
+
+        # 右侧文件类型统计
+        stats_card = tk.Frame(content, bg=Palette.surface, width=self.px(330),
+            highlightthickness=1, highlightbackground=Palette.border)
+        stats_card.pack(side='right', fill='y', padx=(self.px(12), 0))
+        stats_card.pack_propagate(False)
+
+        stats_head = tk.Frame(stats_card, bg=Palette.surface)
+        stats_head.pack(fill='x', padx=self.px(14), pady=(self.px(12), self.px(6)))
+        tk.Label(stats_head, text="文件类型统计", font=(FONT, 11, 'bold'),
+            fg=Palette.text, bg=Palette.surface).pack(side='left')
+        tk.Label(stats_head, text="占比 / 数量 / 大小", font=(FONT, 9),
+            fg=Palette.text_muted, bg=Palette.surface).pack(side='right')
+
+        tk.Frame(stats_card, bg=Palette.border, height=1).pack(fill='x')
+
+        self.stats_text = tk.Text(stats_card,
+            bg=Palette.surface, fg=Palette.text,
+            font=(MONO, 9),
+            relief='flat', bd=0, highlightthickness=0,
+            selectbackground=Palette.selection,
+            state='disabled', wrap='none', cursor='arrow')
+        self.stats_text.pack(fill='both', expand=True,
+            padx=self.px(14), pady=self.px(10))
+        self.stats_text.tag_configure('name', foreground=Palette.text)
+        self.stats_text.tag_configure('bar', foreground=Palette.accent)
+        self.stats_text.tag_configure('num', foreground=Palette.text_muted)
+
+        # 左侧目录树
+        tree_card = tk.Frame(content, bg=Palette.surface,
+            highlightthickness=1, highlightbackground=Palette.border)
+        tree_card.pack(side='left', fill='both', expand=True)
+
+        scroll_y = ttk.Scrollbar(tree_card, orient='vertical', style='Clean.Vertical.TScrollbar')
+        scroll_y.pack(side='right', fill='y', padx=(0, self.px(2)), pady=self.px(2))
+        scroll_x = ttk.Scrollbar(tree_card, orient='horizontal', style='Clean.Horizontal.TScrollbar')
+        scroll_x.pack(side='bottom', fill='x', padx=self.px(2), pady=(0, self.px(2)))
+
+        self.tree = ttk.Treeview(tree_card,
+            style='Clean.Treeview',
+            columns=('size', 'pct'),
+            show='tree headings',
+            yscrollcommand=scroll_y.set,
+            xscrollcommand=scroll_x.set)
+        self.tree.pack(side='left', fill='both', expand=True,
+            padx=self.px(2), pady=self.px(2))
+        scroll_y.config(command=self.tree.yview)
+        scroll_x.config(command=self.tree.xview)
+
+        self.tree.heading('#0', text="名称", anchor='w')
+        self.tree.heading('size', text="大小", anchor='e')
+        self.tree.heading('pct', text="占比", anchor='e')
+        self.tree.column('#0', width=self.px(480), minwidth=self.px(220), stretch=True, anchor='w')
+        self.tree.column('size', width=self.px(105), minwidth=self.px(80), stretch=False, anchor='e')
+        self.tree.column('pct', width=self.px(70), minwidth=self.px(60), stretch=False, anchor='e')
+
+        self.tree.tag_configure('dir', foreground=Palette.text, font=(FONT, 10, 'bold'))
+        self.tree.tag_configure('file', foreground=Palette.text_muted, font=(FONT, 10))
+
+        self.tree.bind("<Button-3>", self.show_context_menu)
+
+    def _build_statusbar(self):
+        bar = tk.Frame(self.root, bg=Palette.surface,
+                       padx=self.px(20), pady=self.px(7))
+        bar.pack(fill='x')
+
+        self.progress = ttk.Progressbar(bar, mode='indeterminate',
+            length=self.px(140), style='Clean.Horizontal.TProgressbar')
+
+        self.scan_label = tk.Label(bar, text="选一个文件夹开始",
+            font=(FONT, 9), fg=Palette.text_muted, bg=Palette.surface)
+        self.scan_label.pack(side='left')
+
+        self.path_label = tk.Label(bar, text="",
+            font=(FONT, 9), fg=Palette.text_soft, bg=Palette.surface)
+        self.path_label.pack(side='left', padx=(self.px(12), 0))
+
     def create_context_menu(self):
         self.context_menu = tk.Menu(self.tree, tearoff=0,
-            bg=self.bg_elevated, fg=self.text_primary,
-            font=('Microsoft YaHei UI', 11))
+            bg=Palette.surface, fg=Palette.text,
+            activebackground=Palette.selection, activeforeground=Palette.text,
+            bd=1, relief='solid',
+            font=(FONT, 10))
         self.context_menu.add_command(label="按大小排序（降序）", command=self.sort_by_size_desc)
         self.context_menu.add_command(label="按大小排序（升序）", command=self.sort_by_size_asc)
         self.context_menu.add_command(label="按名称排序（A-Z）", command=self.sort_by_name_az)
@@ -417,6 +591,8 @@ class NeonGUI:
         self.context_menu.add_command(label="复制名称", command=self.copy_name)
         self.context_menu.add_command(label="复制文件地址", command=self.copy_path)
 
+    # ---------- 扫描流程 ----------
+
     def browse_folder(self):
         folder = filedialog.askdirectory(title="选择要分析的文件夹")
         if folder:
@@ -425,29 +601,32 @@ class NeonGUI:
     def start_analysis(self, path):
         self.analyzed_path = path
         self.current_root = None
+        self.total_bytes = 0
         self.tree.delete(*self.tree.get_children())
         self.item_to_node.clear()
         self.path_to_item.clear()
         self.item_to_path.clear()
         self.live_max_depth = 0
+
         root_node = FileNode(Path(path).name or str(path), 0, True)
-        root_id = self.tree.insert('', 'end', text=f"{root_node.name}  0 B", values=(0, True), tags=('folder',), open=True)
+        root_id = self.tree.insert('', 'end', text=root_node.name,
+            values=self._node_values(root_node, 0), tags=('dir',), open=True)
         self.item_to_node[root_id] = root_node
         self.path_to_item[()] = root_id
         self.item_to_path[root_id] = ()
 
-        self.total_label.config(text="总大小: 0 B")
-        self.count_label.config(text="文件/文件夹: 1")
-        self.depth_label.config(text="最大深度: 0")
-        self.scan_label.config(text="正在扫描... (0 文件)")
-        self.stats_text.config(state='normal')
-        self.stats_text.delete(1.0, 'end')
-        self.stats_text.config(state='disabled')
+        self.total_label.config(text="0 B")
+        self.count_label.config(text="1")
+        self.depth_label.config(text="0")
+        self.scan_label.config(text="正在扫描...")
+        self.path_label.config(text=path)
+        self._clear_stats()
         self.browse_btn.config(state='disabled')
         self.pause_btn.config(state='normal', text="暂停")
         self.stop_btn.config(state='normal')
-        self.progress.pack(side='left', padx=15)
-        self.progress.start()
+        if not self.progress.winfo_ismapped():
+            self.progress.pack(side='right')
+        self.progress.start(12)
 
         self.scan_generation = self.analysis.start(Path(path))
         self._schedule_event_poll()
@@ -469,13 +648,13 @@ class NeonGUI:
         if self.analysis.running or events:
             self._schedule_event_poll()
 
-    def _node_display(self, node: FileNode):
-        return f"{node.name}  {format_size(node.size)}"
+    def _node_values(self, node: FileNode, total: int):
+        total = total or self.total_bytes or node.size
+        pct = (node.size / total * 100.0) if total else 0.0
+        return (format_size(node.size), f"{pct:.1f}%")
 
     def _node_tags(self, node: FileNode):
-        if node.size >= 100 * 1024 * 1024:
-            return ('big',)
-        return ('folder' if node.is_dir else 'file',)
+        return ('dir' if node.is_dir else 'file',)
 
     def _apply_live_batch(self, event):
         for parent_path, node_path, name, size, is_dir in event['entries']:
@@ -486,13 +665,16 @@ class NeonGUI:
                 continue
             node = FileNode(name=name, size=size, is_dir=is_dir)
             item_id = self.tree.insert(
-                parent_id, 'end', text=self._node_display(node),
-                values=(size, is_dir), tags=self._node_tags(node)
+                parent_id, 'end', text=node.name,
+                values=self._node_values(node, event['bytes']),
+                tags=self._node_tags(node)
             )
             self.path_to_item[node_path] = item_id
             self.live_max_depth = max(self.live_max_depth, len(node_path))
             self.item_to_path[item_id] = node_path
             self.item_to_node[item_id] = node
+
+        self.total_bytes = event['bytes']
 
         changed_paths = set()
         for parent_path, delta in event['deltas'].items():
@@ -510,16 +692,15 @@ class NeonGUI:
         for changed_path in changed_paths:
             item_id = self.path_to_item[changed_path]
             node = self.item_to_node[item_id]
-            self.tree.item(item_id, text=self._node_display(node), tags=self._node_tags(node))
-            self.tree.item(item_id, values=(node.size, node.is_dir))
+            self.tree.item(item_id, values=self._node_values(node, self.total_bytes),
+                tags=self._node_tags(node))
 
         total_nodes = event['files'] + event['directories']
-        max_depth = self.live_max_depth
-        self.total_label.config(text=f"总大小: {format_size(event['bytes'])}")
-        self.count_label.config(text=f"文件/文件夹: {total_nodes}")
-        self.depth_label.config(text=f"最大深度: {max_depth}")
-        error_text = f"，跳过 {event['errors']} 项" if event['errors'] else ""
-        self.scan_label.config(text=f"正在扫描... ({event['files']} 文件{error_text})")
+        self.total_label.config(text=format_size(event['bytes']))
+        self.count_label.config(text=f"{total_nodes:,}")
+        self.depth_label.config(text=str(self.live_max_depth))
+        error_text = f"  ·  跳过 {event['errors']} 项" if event['errors'] else ""
+        self.scan_label.config(text=f"正在扫描 {event['files']:,} 个文件{error_text}")
 
     def toggle_pause(self):
         if not self.analysis.running:
@@ -527,11 +708,11 @@ class NeonGUI:
         if self.analysis.paused:
             self.analysis.resume()
             self.pause_btn.config(text="暂停")
-            self.scan_label.config(text=f"正在扫描... ({self.analysis.files_scanned} 文件)")
+            self.scan_label.config(text=f"正在扫描 {self.analysis.files_scanned:,} 个文件")
         else:
             self.analysis.pause()
             self.pause_btn.config(text="继续")
-            self.scan_label.config(text=f"已暂停 ({self.analysis.files_scanned} 文件)")
+            self.scan_label.config(text=f"已暂停  ·  {self.analysis.files_scanned:,} 个文件")
 
     def stop_analysis(self):
         if not self.analysis.running:
@@ -550,15 +731,17 @@ class NeonGUI:
         self.stop_btn.config(state='disabled')
         root = event['root']
         self.current_root = root
+        self.total_bytes = root.size
         self._adopt_final_tree(root)
         status = "已停止" if event['cancelled'] else "扫描完成"
-        error_text = f"，跳过 {event['errors']} 项" if event['errors'] else ""
-        self.scan_label.config(text=f"{status} ({event['files']} 文件{error_text})")
+        error_text = f"  ·  跳过 {event['errors']} 项" if event['errors'] else ""
+        self.scan_label.config(text=f"{status}  ·  {event['files']:,} 个文件{error_text}")
 
     def _adopt_final_tree(self, root):
         node_count = 0
         max_depth = 0
         self.item_to_node.clear()
+        total = root.size or 1
 
         def adopt(node, rel_path, depth):
             nonlocal node_count, max_depth
@@ -567,8 +750,8 @@ class NeonGUI:
             item_id = self.path_to_item.get(rel_path)
             if item_id:
                 self.item_to_node[item_id] = node
-                self.tree.item(item_id, text=self._node_display(node), tags=self._node_tags(node))
-                self.tree.item(item_id, values=(node.size, node.is_dir))
+                self.tree.item(item_id, text=node.name,
+                    values=self._node_values(node, total), tags=self._node_tags(node))
                 for index, child in enumerate(node.children):
                     child_path = rel_path + (child.name,)
                     child_id = self.path_to_item.get(child_path)
@@ -577,9 +760,9 @@ class NeonGUI:
                     adopt(child, child_path, depth + 1)
 
         adopt(root, (), 0)
-        self.total_label.config(text=f"总大小: {format_size(root.size)}")
-        self.count_label.config(text=f"文件/文件夹: {node_count}")
-        self.depth_label.config(text=f"最大深度: {max_depth}")
+        self.total_label.config(text=format_size(root.size))
+        self.count_label.config(text=f"{node_count:,}")
+        self.depth_label.config(text=str(max_depth))
         self.update_file_stats(root)
 
     def build_tree(self, root):
@@ -587,16 +770,18 @@ class NeonGUI:
         self.item_to_node.clear()
         self.path_to_item.clear()
         self.item_to_path.clear()
+        self.total_bytes = root.size
         node_count = 0
         max_depth = 0
+        total = root.size or 1
 
         def insert_node(parent_id, node, rel_path, depth):
             nonlocal node_count, max_depth
             node_count += 1
             max_depth = max(max_depth, depth)
             item_id = self.tree.insert(
-                parent_id, 'end', text=self._node_display(node),
-                values=(node.size, node.is_dir), tags=self._node_tags(node),
+                parent_id, 'end', text=node.name,
+                values=self._node_values(node, total), tags=self._node_tags(node),
                 open=depth < 3,
             )
             self.item_to_node[item_id] = node
@@ -608,10 +793,14 @@ class NeonGUI:
 
         insert_node('', root, (), 0)
         self.live_max_depth = max_depth
-        self.total_label.config(text=f"总大小: {format_size(root.size)}")
-        self.count_label.config(text=f"文件/文件夹: {node_count}")
-        self.depth_label.config(text=f"最大深度: {max_depth}")
-        self.update_file_stats(root)
+        self.total_label.config(text=format_size(root.size))
+        self.count_label.config(text=f"{node_count:,}")
+        self.depth_label.config(text=str(max_depth))
+
+    def _clear_stats(self):
+        self.stats_text.config(state='normal')
+        self.stats_text.delete(1.0, 'end')
+        self.stats_text.config(state='disabled')
 
     def update_file_stats(self, root):
         stats = {}
@@ -628,15 +817,22 @@ class NeonGUI:
         collect_stats(root)
         sorted_stats = sorted(stats.items(), key=lambda x: x[1]['size'], reverse=True)[:20]
         max_size = sorted_stats[0][1]['size'] if sorted_stats else 1
-        text = ""
-        for ext, data in sorted_stats:
-            bar_len = int(data['size'] / max_size * 25)
-            bar = "█" * bar_len + "░" * (25 - bar_len)
-            text += f".{ext:<8} {bar}  {data['count']:>4}  {format_size(data['size'])}\n"
+
         self.stats_text.config(state='normal')
         self.stats_text.delete(1.0, 'end')
-        self.stats_text.insert('end', text)
+        for ext, data in sorted_stats:
+            bar_len = max(1, int(data['size'] / max_size * 12))
+            label = '.' + ext
+            if len(label) > 9:
+                label = label[:8] + '…'
+            self.stats_text.insert('end', f"{label:<9}", 'name')
+            self.stats_text.insert('end', "█" * bar_len, 'bar')
+            self.stats_text.insert('end', " " * (13 - bar_len), 'bar')
+            self.stats_text.insert('end', f"{data['count']:>5}  ", 'num')
+            self.stats_text.insert('end', f"{format_size(data['size']):>10}\n", 'num')
         self.stats_text.config(state='disabled')
+
+    # ---------- 交互 ----------
 
     def show_context_menu(self, event):
         item = self.tree.identify_row(event.y)
@@ -753,5 +949,5 @@ class NeonGUI:
 
 
 if __name__ == "__main__":
-    app = NeonGUI()
+    app = FolderSizeGUI()
     app.run()
