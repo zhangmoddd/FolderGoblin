@@ -693,6 +693,7 @@ class StructureWindow:
         self._pending_anchor = None              # 缩放完要把哪块按回光标底下
         self._block_nodes = {}                   # 画布图元 -> 节点
         self._block_rects = {}                   # 节点 id -> 它那块的位置（高亮用）
+        self._block_parents = {}                 # 节点 id -> 装着它的那块（画虚线用）
         self._highlight = None                   # 鼠标压住的那块的高亮框
         self._hover_node = None
         self._render_job = None
@@ -862,6 +863,7 @@ class StructureWindow:
         self.canvas.delete('all')
         self._block_nodes.clear()
         self._block_rects.clear()
+        self._block_parents.clear()
         node = self.current()
         self.where_label.config(text=elide_middle(self.path_of(node), 72))
         self.back_btn.config(state='normal' if len(self.stack) > 1 else 'disabled')
@@ -903,6 +905,7 @@ class StructureWindow:
             return
         boxes = squarify(self._children_to_draw(node), 0.0, 0.0, float(width), float(height))
         for index, (child, bx, by, bw, bh) in enumerate(boxes):
+            self._block_parents[id(child)] = node
             self._draw_treemap_block(child, bx, by, bw, bh, 1, index % len(self.FAMILIES))
         self.canvas.configure(scrollregion=(0, 0, width, height))
 
@@ -936,6 +939,7 @@ class StructureWindow:
             inner = squarify(self._children_to_draw(node), x, y + header,
                              max(0.0, width), max(0.0, height - header))
             for child, bx, by, bw, bh in inner:
+                self._block_parents[id(child)] = node
                 self._draw_treemap_block(child, bx, by, bw, bh, level + 1, family)
         if node.is_dir and node.children and not inner:
             self._draw_void_hint(node, x, y, width, height)
@@ -1249,10 +1253,15 @@ class StructureWindow:
                           f"{format_size(node.size)}  ·  占这里 {share:.1f}%")
 
     def _highlight_block(self, node):
-        """鼠标压住哪块，就给哪块描个蓝边 —— 一眼知道现在指的是哪块。"""
+        """鼠标压住哪块：粗蓝实线框它自己，细蓝虚线框"装着它的文件夹"。
+
+        有虚线圈着 = 这块在人家里面；一圈虚线都没有 = 它就是最外层的，
+        别被挤在大块角落缝里的小方块骗了 —— 那是邻居，不是成员。
+        """
         if self._highlight is not None:
             self.canvas.delete(self._highlight)
             self._highlight = None
+        self.canvas.delete('hover_chain')
         rect = self._block_rects.get(id(node)) if node is not None else None
         if rect is None:
             return
@@ -1260,6 +1269,16 @@ class StructureWindow:
         self._highlight = self.canvas.create_rectangle(
             x - 1, y - 1, x + width + 1, y + height + 1,
             outline=Palette.accent, width=2)
+        parent = self._block_parents.get(id(node))
+        while parent is not None:
+            prect = self._block_rects.get(id(parent))
+            if prect is None:
+                break
+            self.canvas.create_rectangle(
+                prect[0] - 1, prect[1] - 1,
+                prect[0] + prect[2] + 1, prect[1] + prect[3] + 1,
+                outline=Palette.accent, width=1, dash=(3, 3), tags='hover_chain')
+            parent = self._block_parents.get(id(parent))
 
     def _on_leave(self, _event):
         self.tip.cancel()
