@@ -104,6 +104,11 @@ def pad_to(text: str, width: int) -> str:
     return text + ' ' * max(1, width - display_width(text))
 
 
+def pad_left(text: str, width: int) -> str:
+    """右对齐的补齐：中文占两格，所以也得按"几格"算，不能按字数算。"""
+    return ' ' * max(0, width - display_width(text)) + text
+
+
 def format_size(bytes_size: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB", "PB"]
     unit_idx = 0
@@ -351,6 +356,8 @@ class AnalysisThread:
 class FolderSizeGUI:
     SLICE_SECONDS = 0.008        # 每次轮询最多占用主线程 8 毫秒，超了就下一轮接着干
     MAX_LABEL_REFRESH = 200      # 每轮最多刷新 200 个节点的文字，防止父节点太多把主线程拖住
+    STATS_TOP = 19               # 右侧"文件类型统计"最多列这么多种（加上表头刚好一屏）
+    STATS_NAME_WIDTH = 9         # 那一栏里文件类型名占几格
 
     def __init__(self):
         self.dpi_ok = enable_dpi_awareness()
@@ -617,8 +624,10 @@ class FolderSizeGUI:
         stats_head.pack(fill='x', padx=self.px(14), pady=(self.px(12), self.px(6)))
         tk.Label(stats_head, text="文件类型统计", font=(FONT, 11, 'bold'),
             fg=Palette.text, bg=Palette.surface).pack(side='left')
-        tk.Label(stats_head, text="占比 / 数量 / 大小", font=(FONT, 9),
-            fg=Palette.text_muted, bg=Palette.surface).pack(side='right')
+        # 这行小字写"列了几类、一共几类" —— 不然把下面的数字加起来对不上总数，又得犯嘀咕
+        self.stats_hint = tk.Label(stats_head, text="扫描完成后显示", font=(FONT, 9),
+            fg=Palette.text_muted, bg=Palette.surface)
+        self.stats_hint.pack(side='right')
 
         tk.Frame(stats_card, bg=Palette.border, height=1).pack(fill='x')
 
@@ -631,8 +640,10 @@ class FolderSizeGUI:
         self.stats_text.pack(fill='both', expand=True,
             padx=self.px(14), pady=self.px(10))
         self.stats_text.tag_configure('name', foreground=Palette.text)
-        self.stats_text.tag_configure('bar', foreground=Palette.accent)
+        self.stats_text.tag_configure('head', foreground=Palette.text_soft)
+        self.stats_text.tag_configure('accent', foreground=Palette.accent)
         self.stats_text.tag_configure('num', foreground=Palette.text_muted)
+        self.stats_text.tag_configure('dim', foreground=Palette.text_soft)
 
         # 面板下半截：没算进去的东西（正常情况下是"无"）
         tk.Frame(stats_card, bg=Palette.border, height=1).pack(fill='x')
@@ -1212,23 +1223,52 @@ class FolderSizeGUI:
         self._scanning = False
 
     def _render_stats(self, ext_stats):
-        """把扫描线程顺手攒好的"文件类型统计"画出来。"""
-        rows = sorted(ext_stats.items(), key=lambda kv: kv[1][1], reverse=True)[:20]
-        max_size = rows[0][1][1] if rows else 1
+        """把扫描线程顺手攒好的"文件类型统计"画出来。
+
+        一行三样，每样都带单位，不许让人猜：
+          · 占全部 —— 这类文件的大小占总共的百分之几（真占比，不是跟最大那类比）
+          · 文件数 —— 这类文件有多少个（后面带个"个"字）
+          · 大小   —— 这类文件加起来多大（后面带 B / KB / MB / GB）
+        以前是"一根柱子 + 两个光秃秃的数字"，柱长还是拿最大那类当满格比的，
+        标题却写"占比 / 数量 / 大小" —— 新用户看了一准懵。
+        """
+        total = self.total_bytes or sum(size for _count, size in ext_stats.values()) or 1
+        rows = sorted(ext_stats.items(), key=lambda kv: kv[1][1], reverse=True)[:self.STATS_TOP]
+        kinds = len(ext_stats)
+        if kinds > len(rows):
+            self.stats_hint.config(text=f"只列最大的 {len(rows)} 类，共 {kinds} 类")
+        else:
+            self.stats_hint.config(text=f"共 {kinds} 类，全在这儿了")
         self.stats_text.config(state='normal')
         self.stats_text.delete(1.0, 'end')
-        for ext, data in rows:
-            count, size = data[0], data[1]
-            bar_len = max(1, int(size / max_size * 12))
-            label = '.' + ext
-            if len(label) > 9:
-                label = label[:8] + '…'
-            self.stats_text.insert('end', f"{label:<9}", 'name')
-            self.stats_text.insert('end', "█" * bar_len, 'bar')
-            self.stats_text.insert('end', " " * (13 - bar_len), 'bar')
-            self.stats_text.insert('end', f"{count:>5}  ", 'num')
-            self.stats_text.insert('end', f"{format_size(size):>10}\n", 'num')
+        if not rows:
+            self.stats_text.insert('end', "里面一个文件都没有\n", 'dim')
+        else:
+            self.stats_text.insert('end', self._stats_header(), 'head')
+            for ext, (count, size) in rows:
+                label = '.' + ext
+                if display_width(label) > self.STATS_NAME_WIDTH:
+                    label = label[:self.STATS_NAME_WIDTH - 1] + '…'
+                self.stats_text.insert('end', pad_to(label, self.STATS_NAME_WIDTH), 'name')
+                self.stats_text.insert('end', pad_left(self._percent_text(size, total), 7), 'accent')
+                self.stats_text.insert('end', f"{count:>8,} 个", 'num')
+                self.stats_text.insert('end', f"{format_size(size):>11}\n", 'num')
         self.stats_text.config(state='disabled')
+
+    @staticmethod
+    def _percent_text(size: int, total: int) -> str:
+        """占比怎么显示。小到不足 0.1% 的就写"<0.1%"，别写成"0.0%"让人以为算错了。"""
+        percent = size / total * 100.0
+        if percent <= 0:
+            return "0%"
+        if percent < 0.1:
+            return "<0.1%"
+        return f"{percent:.1f}%"
+
+    def _stats_header(self) -> str:
+        """表头。凑巧的是：不写单位反而最清楚 —— 数字自己都带着单位呢。"""
+        return (pad_to('类型', self.STATS_NAME_WIDTH) + pad_left('占全部', 7)
+                + pad_left('文件数', 10) + pad_left('大小', 11) + '\n')
 
     def _fill_uncounted(self, symlinks, errors, error_kinds=None):
         """只列真正没算进总数里的东西，并说清楚是"没权限"还是"盘坏了"。"""
@@ -1303,7 +1343,9 @@ class FolderSizeGUI:
     def _clear_stats(self):
         self.stats_text.config(state='normal')
         self.stats_text.delete(1.0, 'end')
+        self.stats_text.insert('end', "扫描完成后在这里显示\n", 'dim')
         self.stats_text.config(state='disabled')
+        self.stats_hint.config(text="扫描完成后显示")
 
     def _clear_uncounted(self):
         self.uncounted_text.config(state='normal')
