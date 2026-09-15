@@ -33,5 +33,9 @@ FolderSizeAnalyzer.exe
 *.spec
 _build_tmp/
 
+# ===== 发布物（exe 走 GitHub Release 发，不进仓库）=====
+*.zip
+dist/
+
 # ===== worktree：多 AI 并行开发的工作副本 =====
 worktrees/
