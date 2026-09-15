@@ -305,6 +305,7 @@ class AnalysisThread:
 class FolderSizeGUI:
     SLICE_SECONDS = 0.008        # 每次轮询最多占用主线程 8 毫秒，超了就下一轮接着干
     MAX_LABEL_REFRESH = 200      # 每轮最多刷新 200 个节点的文字，防止父节点太多把主线程拖住
+    PLACEHOLDER = '载入中…'       # 垫在文件夹下面的占位行，专门为了让展开箭头画出来
 
     def __init__(self):
         self.dpi_ok = enable_dpi_awareness()
@@ -340,8 +341,10 @@ class FolderSizeGUI:
         self._deferred = {}           # 父文件夹没展开的条目先存这儿，等展开再摆
         self._open_paths = {()}       # 哪些文件夹是展开的（() 就是根）
         self._node_override = {}      # 点开文件夹时，把真正的节点对象带给摆行的那段代码
-        self._open_new_rows = False   # 新摆上的行要不要直接展开（搜索用）
+        self._open_on_insert = set()  # 这些路径的行摆上时要直接展开（搜索、展开全部用）
+        self._placeholder_of = {}     # 文件夹行 -> 它下面那条占位行
         self._last_click_item = ''
+        self._placeholder_of = {}     # 文件夹行 -> 它下面那条占位行
         self._scanning = False        # 是不是在扫（决定要不要刷标题栏那排数字）
         self._pre_search_open = None  # 搜索前的展开状态，清空搜索时恢复用
         self._after_queue_label = None  # 队里这些行摆完之后，状态栏显示什么
@@ -637,6 +640,7 @@ class FolderSizeGUI:
 
         self.tree.tag_configure('dir', foreground=Palette.text, font=(FONT, 10, 'bold'))
         self.tree.tag_configure('file', foreground=Palette.text_muted, font=(FONT, 10))
+        self.tree.tag_configure('placeholder', foreground=Palette.text_soft, font=(FONT, 10))
 
         self.tree.bind("<Button-3>", self.show_context_menu)
         self.tree.bind("<Button-1>", self.on_tree_click)
@@ -701,7 +705,8 @@ class FolderSizeGUI:
         self._deferred = {}
         self._open_paths = {()}
         self._node_override = {}
-        self._open_new_rows = False
+        self._open_on_insert = set()
+        self._placeholder_of = {}
         self._scanning = True
         self._pre_search_open = None
         self._after_queue_label = None
@@ -772,7 +777,7 @@ class FolderSizeGUI:
         if self._scanning:
             self._refresh_header()
         if not self._queue_entries:
-            self._open_new_rows = False
+            self._open_on_insert.clear()
 
         if self._queue_entries or self.analysis.running or events:
             self._schedule_event_poll(idle=True)
@@ -801,6 +806,8 @@ class FolderSizeGUI:
         open_paths = self._open_paths
         deferred = self._deferred
         overrides = self._node_override
+        open_on_insert = self._open_on_insert
+        placeholders = self._placeholder_of
         total = len(entries)
         index = 0
         while index < total and time.monotonic() < deadline:
@@ -822,10 +829,18 @@ class FolderSizeGUI:
                 node = FileNode(name, size, is_dir)
             item_id = self.tree.insert(parent_id, 'end', text=name,
                 values=self._node_values(node, self.total_bytes),
-                tags=self._node_tags(node), open=self._open_new_rows)
+                tags=self._node_tags(node), open=node_path in open_on_insert)
             path_to_item[node_path] = item_id
             self.item_to_path[item_id] = node_path
             self.item_to_node[item_id] = node
+            # 真内容进来了，父文件夹下面那条占位行可以撤了
+            ph = placeholders.pop(parent_id, None)
+            if ph is not None:
+                self.tree.delete(ph)
+            if is_dir and node_path not in placeholders:
+                # 文件夹下面先垫一条占位行，Tk 才会画出展开箭头
+                placeholders[node_path] = self.tree.insert(item_id, 'end',
+                    text=self.PLACEHOLDER, values=('', ''), tags=('placeholder',))
             depth = len(node_path)
             if depth > self.live_max_depth:
                 self.live_max_depth = depth
@@ -870,6 +885,13 @@ class FolderSizeGUI:
         if self._load_children(path):
             self._finished = False
             self._schedule_event_poll(idle=True)
+        else:
+            # 里面确实没东西，把占位行撤掉，箭头也就跟着消失
+            node = self.item_to_node.get(item_id)
+            if node is None or not node.children:
+                ph = self._placeholder_of.pop(item_id, None)
+                if ph is not None:
+                    self.tree.delete(ph)
 
     def on_tree_close(self, event):
         path = self.item_to_path.get(self.tree.focus())
@@ -895,12 +917,12 @@ class FolderSizeGUI:
 
     def _rebuild_lazy(self, open_paths):
         """把列表清空重摆：只摆 open_paths 里那些文件夹的下一层。"""
-        self._rebuild_lazy_from(self._collect_visible(open_paths), open_paths)
+        self._rebuild_lazy_from(self._collect_visible(open_paths), open_paths, open_paths)
 
-    def _rebuild_lazy_from(self, rows, open_paths):
+    def _rebuild_lazy_from(self, rows, open_paths, open_on_insert=None):
         self._reset_tree()
         self._open_paths = set(open_paths) | {()}
-        self._open_new_rows = True
+        self._open_on_insert = set() if open_on_insert is None else set(open_on_insert)
         queued = self._queue_entries
         for _depth, child_path, rel_path, child in rows:
             queued.append((rel_path, child_path, child.name, child.size, child.is_dir))
@@ -916,6 +938,8 @@ class FolderSizeGUI:
         self._queue_entries = []
         self._node_override.clear()
         self._deferred = {}
+        self._placeholder_of = {}
+        self._open_on_insert = set()
         self.live_max_depth = 0
         root = self.current_root
         name = root.name if root else ''
@@ -926,6 +950,9 @@ class FolderSizeGUI:
         self.item_to_node[root_id] = root if root else root_node
         self.path_to_item[()] = root_id
         self.item_to_path[root_id] = ()
+        # 根下面也先垫一条，等真行摆上来就撤掉
+        self._placeholder_of[()] = self.tree.insert(root_id, 'end',
+            text=self.PLACEHOLDER, values=('', ''), tags=('placeholder',))
 
     def _apply_queued_deltas(self):
         """把攒下来的大小加到各级父节点上。数字全加，但标签每轮最多刷 200 个。"""
@@ -1068,6 +1095,11 @@ class FolderSizeGUI:
             item_to_node[item_id] = node
             tree.item(item_id, text=node.name,
                 values=self._node_values(node, total), tags=self._node_tags(node))
+            if not node.children:
+                # 空文件夹：把占位行撤了，省得它一直显示"载入中"
+                ph = self._placeholder_of.pop(item_id, None)
+                if ph is not None:
+                    tree.delete(ph)
             desired = []
             for child in node.children:
                 child_path = rel_path + (child.name,)
@@ -1229,11 +1261,17 @@ class FolderSizeGUI:
                     stack.append((child, rel_path + (child.name,)))
         rows.sort(key=lambda row: row[0])
 
+        # 哪些文件夹需要展开：只要它的下一层还有命中/上级行要显示，就得展开
+        need_open = set()
+        for path in keep:
+            if path:
+                need_open.add(path[:-1])
+
         if self._pre_search_open is None:
             self._pre_search_open = set(self._open_paths)
-        self.scan_label.config(text=f"正在显示搜索结果...")
+        self.scan_label.config(text="正在显示搜索结果...")
         self._after_queue_label = f"搜索 “{query}” · 找到 {len(keep) - 1:,} 项"
-        self._rebuild_lazy_from(rows, keep)
+        self._rebuild_lazy_from(rows, need_open, need_open)
 
     def clear_search(self):
         if not self.current_root:
