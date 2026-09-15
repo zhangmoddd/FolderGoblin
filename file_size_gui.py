@@ -10,6 +10,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Dict, List, Optional
@@ -119,6 +120,103 @@ def elide_middle(text: str, limit: int) -> str:
     keep = max(1, limit - 1)
     head = int(keep * 0.45)
     return text[:head] + '…' + text[len(text) - (keep - head):]
+
+
+# ---------- 结构图的排版算法（纯计算，不碰界面，好单独测） ----------
+
+def squarify(items, x, y, width, height):
+    """方块图排版：把一块地方按大小比例分给一堆东西。
+
+    items 是 [(节点, 大小)]，调用前按大小从大到小排好。
+    返回 [(节点, x, y, 宽, 高), ...]。
+
+    用的是方块图的老算法：一行一行贴着短边铺，铺到"再塞进去就变成细长条"就换下一行 ——
+    细长条最看不清东西，所以宁可慢慢凑，也要让每块尽量接近正方形。
+    """
+    boxes = []
+    total = sum(size for _node, size in items)
+    if total <= 0 or width <= 0 or height <= 0 or not items:
+        return boxes
+    scale = (width * height) / float(total)          # 一个字节占多少面积
+    rest = list(items)
+    cx, cy, cw, ch = float(x), float(y), float(width), float(height)
+    while rest:
+        if cw >= ch:
+            row, area, used = _take_row(rest, ch, scale)
+            band = area / ch if ch else 0.0          # 这一条有多宽
+            oy = cy
+            for node, size in row:
+                piece = (size * scale / band) if band else 0.0
+                boxes.append((node, cx, oy, band, piece))
+                oy += piece
+            cx += band
+            cw -= band
+        else:
+            row, area, used = _take_row(rest, cw, scale)
+            band = area / cw if cw else 0.0          # 这一条有多高
+            ox = cx
+            for node, size in row:
+                piece = (size * scale / band) if band else 0.0
+                boxes.append((node, ox, cy, piece, band))
+                ox += piece
+            cy += band
+            ch -= band
+        del rest[:used]
+    return boxes
+
+
+def _take_row(items, side, scale):
+    """从 items 头上凑一条：这条沿着 side 铺满，往里塞到"再塞就变细长条"为止。
+
+    返回 (这条里有哪些, 这条占多少面积, 用掉了几个)。好歹会塞一个进去，不会卡死。
+    """
+    row = []
+    area = 0.0
+    best = None
+    for index, (node, size) in enumerate(items):
+        next_area = area + size * scale
+        thickness = next_area / side if side else 0.0
+        if thickness <= 0:
+            break
+        longest = max(s * scale / thickness for _n, s in items[:index + 1])
+        shortest = min(thickness, longest)
+        ratio = (max(thickness, longest) / shortest) if shortest > 0 else float('inf')
+        if best is not None and ratio > best:
+            break
+        best = ratio
+        area = next_area
+        row.append((node, size))
+    if not row:
+        row = [items[0]]
+        area = items[0][1] * scale
+    return row, area, len(row)
+
+
+def mindmap_rows(root, max_depth, min_size, row_height):
+    """思维导图排版：一层占一列，从上往下铺。
+
+    返回 [(节点, 第几层, 中心 y), ...]，父在前、子在后，照着顺序画就行。
+    地盘大的排前面（跟列表里一个顺序）。
+    """
+    rows = []
+    cursor = [row_height / 2.0]
+
+    def walk(node, level):
+        kids = []
+        if level < max_depth:
+            kids = [child for child in node.children if child.size >= min_size]
+        if kids:
+            centres = [walk(child, level + 1) for child in kids]
+            centre_y = (centres[0] + centres[-1]) / 2.0
+        else:
+            centre_y = cursor[0]
+            cursor[0] += row_height
+        rows.append((node, level, centre_y))
+        return centre_y
+
+    walk(root, 0)
+    rows.reverse()          # 父在前、子在后
+    return rows
 
 
 def format_size(bytes_size: int) -> str:
@@ -365,6 +463,62 @@ class AnalysisThread:
         self._pause_event.set()
 
 
+def toggle_scrollbar(bar, needed: bool, before, side, fill, padx, pady):
+    """滚动条该露脸就摆上、不该露就收起来。
+
+    摆的时候插在 before 前头 —— 不然它排在列表后头，列表先把地方占光，它就挤不进去了。
+    """
+    if needed == bool(bar.winfo_manager()):
+        return
+    if needed:
+        bar.pack(side=side, fill=fill, padx=padx, pady=pady, before=before)
+    else:
+        bar.pack_forget()
+
+
+class HoverTip:
+    """鼠标停一会儿才弹的小气泡（整套程序共用一个，不会留一堆残影）。"""
+
+    def __init__(self, root, font, delay_ms=450, pad=(8, 4)):
+        self.root = root
+        self.font = font
+        self.delay_ms = delay_ms
+        self.pad = pad
+        self._job = None
+        self._window = None
+        self._label = None
+
+    def schedule(self, text):
+        self.cancel()
+        if not text:
+            return
+        self._job = self.root.after(self.delay_ms, lambda: self._pop(text))
+
+    def cancel(self):
+        if self._job is not None:
+            self.root.after_cancel(self._job)
+            self._job = None
+        if self._window is not None and self._window.winfo_ismapped():
+            self._window.withdraw()
+
+    def _pop(self, text):
+        self._job = None
+        if self._window is None:
+            self._window = tk.Toplevel(self.root)
+            self._window.overrideredirect(True)
+            self._window.attributes('-topmost', True)
+            self._label = tk.Label(self._window, text=text, font=self.font,
+                bg=Palette.text, fg='#FFFFFF', padx=self.pad[0], pady=self.pad[1],
+                justify='left')
+            self._label.pack()
+        else:
+            self._label.config(text=text)
+        x, y = self.root.winfo_pointerxy()
+        self._window.geometry(f"+{x + 14}+{y + 18}")
+        self._window.deiconify()
+        self._window.lift()
+
+
 class CleanScrollbar(tk.Canvas):
     """自己画的滚动条。
 
@@ -491,6 +645,349 @@ class CleanScrollbar(tk.Canvas):
             self.command('scroll', -1 if event.delta > 0 else 1, 'units')
 
 
+class StructureWindow:
+    """结构图窗口：一座文件夹的"全景图"。
+
+    两种看法：
+      · 方块图 —— 一块地方 = 一个文件夹，面积就是它的大小，谁占地方一眼就看出来；
+      · 思维导图 —— 一层占一列，看的是层级结构。
+    两个旋钮随时改（改完立刻重画）：画到第几层、小于百分之几的不画。
+    点一块钻进去看它里面，右键或按钮退回上一层，鼠标停住看完整路径。
+    """
+
+    ROW_HEIGHT = 26         # 思维导图：一行多高
+    COLUMN_WIDTH = 232      # 思维导图：一层占多宽
+    MIN_BLOCK_PX = 3.0      # 方块小于这么多像素就不画了（画了也看不清）
+    HEADER_PX = 15.0        # 方块顶上留给名字的那条窄边
+
+    # 每一支一个颜色，浅深再分层级 —— 一眼能看出哪些块是"同一支"的
+    FAMILIES = (
+        ('#1D4ED8', '#3B82F6', '#BFDBFE'),
+        ('#0F766E', '#14B8A6', '#99F6E4'),
+        ('#6D28D9', '#8B5CF6', '#DDD6FE'),
+        ('#B45309', '#F59E0B', '#FDE68A'),
+        ('#BE123C', '#F43F5E', '#FECDD3'),
+        ('#047857', '#10B981', '#A7F3D0'),
+        ('#334155', '#64748B', '#CBD5E1'),
+    )
+
+    def __init__(self, gui):
+        self.gui = gui
+        self.scale = gui.scale
+        self.font = tkfont.Font(family=FONT, size=8)
+        self.stack = [gui.current_root]          # 钻进来的路径（最后一个就是现在看的）
+        self.mode = tk.StringVar(value='treemap')
+        self.depth = tk.IntVar(value=3)
+        self.min_share = tk.DoubleVar(value=0.3)
+        self._block_nodes = {}                   # 画布图元 -> 节点
+        self._hover_node = None
+        self._render_job = None
+        self.tip = HoverTip(gui.root, (FONT, 9), pad=(self.px(8), self.px(4)))
+
+        self.win = tk.Toplevel(gui.root)
+        self.win.title("结构图")
+        self.win.configure(bg=Palette.app_bg)
+        self.win.geometry(f"{self.px(1080)}x{self.px(740)}")
+        self.win.minsize(self.px(760), self.px(480))
+        self.win.protocol('WM_DELETE_WINDOW', self.close)
+        self._build()
+        self.win.after(80, self._render)
+
+    def px(self, value: float) -> int:
+        return max(1, int(round(value * self.scale)))
+
+    # ---------- 搭界面 ----------
+
+    def _build(self):
+        bar = tk.Frame(self.win, bg=Palette.surface, padx=self.px(14), pady=self.px(10))
+        bar.pack(fill='x')
+
+        self.mode_buttons = {
+            'treemap': self.gui._button(bar, "", lambda: self.set_mode('treemap'), 'ghost'),
+            'mindmap': self.gui._button(bar, "", lambda: self.set_mode('mindmap'), 'ghost'),
+        }
+        self.mode_buttons['treemap'].pack(side='left')
+        self.mode_buttons['mindmap'].pack(side='left', padx=(self.px(4), 0))
+
+        tk.Frame(bar, bg=Palette.border, width=1).pack(
+            side='left', fill='y', padx=self.px(12), pady=self.px(2))
+
+        tk.Label(bar, text="画到第", font=(FONT, 9), fg=Palette.text_muted,
+                 bg=Palette.surface).pack(side='left')
+        tk.Spinbox(bar, from_=1, to=8, width=2, textvariable=self.depth,
+            command=self._render, font=(FONT, 9), justify='center',
+            relief='flat', bg=Palette.surface_alt, fg=Palette.text,
+            buttonbackground=Palette.surface_alt, highlightthickness=1,
+            highlightbackground=Palette.border).pack(side='left', padx=self.px(4))
+        tk.Label(bar, text="层", font=(FONT, 9), fg=Palette.text_muted,
+                 bg=Palette.surface).pack(side='left')
+
+        tk.Label(bar, text="小于", font=(FONT, 9), fg=Palette.text_muted,
+                 bg=Palette.surface).pack(side='left', padx=(self.px(14), 0))
+        tk.Spinbox(bar, from_=0, to=50, increment=0.1, width=4, textvariable=self.min_share,
+            command=self._render, font=(FONT, 9), justify='center',
+            relief='flat', bg=Palette.surface_alt, fg=Palette.text,
+            buttonbackground=Palette.surface_alt, highlightthickness=1,
+            highlightbackground=Palette.border).pack(side='left', padx=self.px(4))
+        tk.Label(bar, text="% 的不画", font=(FONT, 9), fg=Palette.text_muted,
+                 bg=Palette.surface).pack(side='left')
+
+        self.back_btn = self.gui._button(bar, "返回上一层", self.go_back, 'secondary')
+        self.back_btn.pack(side='left', padx=(self.px(16), 0))
+
+        self.where_label = tk.Label(bar, text="", font=(FONT, 9),
+            fg=Palette.text_soft, bg=Palette.surface)
+        self.where_label.pack(side='right')
+
+        body = tk.Frame(self.win, bg=Palette.app_bg, padx=self.px(14), pady=self.px(12))
+        body.pack(fill='both', expand=True)
+        card = tk.Frame(body, bg=Palette.surface,
+            highlightthickness=1, highlightbackground=Palette.border)
+        card.pack(fill='both', expand=True)
+
+        self.canvas = tk.Canvas(card, bg=Palette.surface, highlightthickness=0, bd=0,
+            yscrollcommand=self._on_yscroll, xscrollcommand=self._on_xscroll)
+        self.scroll_y = CleanScrollbar(card, orient='vertical', command=self.canvas.yview)
+        self.scroll_x = CleanScrollbar(card, orient='horizontal', command=self.canvas.xview)
+        self.canvas.pack(side='left', fill='both', expand=True)
+        self.canvas.bind('<Configure>', lambda _event: self._render_soon())
+        self.canvas.bind('<Motion>', self._on_motion)
+        self.canvas.bind('<Leave>', lambda _event: self.tip.cancel())
+        self.canvas.bind('<Button-1>', self._on_click)
+        self.canvas.bind('<Button-3>', lambda _event: self.go_back())
+
+        tk.Label(self.win,
+            text="点一块 = 钻进去看它里面 · 右键或“返回上一层”退回 · 鼠标停住看完整路径",
+            font=(FONT, 9), fg=Palette.text_soft, bg=Palette.app_bg,
+            padx=self.px(18), pady=self.px(8)).pack(fill='x')
+
+        self._refresh_mode_buttons()
+
+    def _refresh_mode_buttons(self):
+        for name, label in (('treemap', "方块图"), ('mindmap', "思维导图")):
+            mark = '◉ ' if self.mode.get() == name else '○ '
+            self.mode_buttons[name].config(text=mark + label)
+
+    def set_mode(self, mode):
+        if mode != self.mode.get():
+            self.mode.set(mode)
+            self._refresh_mode_buttons()
+            self._render()
+
+    def go_back(self):
+        if len(self.stack) > 1:
+            self.stack.pop()
+            self._render()
+
+    # ---------- 现在看的是哪个文件夹 ----------
+
+    def current(self):
+        return self.stack[-1]
+
+    def path_of(self, node) -> str:
+        """这个节点在磁盘上的完整路径（靠钻进来的这条链拼出来）。"""
+        parts = [item.name for item in self.stack[1:]]
+        if node is not self.current():
+            parts.append(node.name)
+        base = self.gui.analyzed_path or ''
+        return str(Path(base).joinpath(*parts)) if parts else base
+
+    def min_size(self) -> float:
+        """小于这个字节数的就不画（旋钮是百分比）。"""
+        try:
+            share = float(self.min_share.get())
+        except (tk.TclError, ValueError):
+            share = 0.0
+        return max(0.0, self.current().size * share / 100.0)
+
+    def levels(self) -> int:
+        try:
+            return max(1, min(8, int(self.depth.get())))
+        except (tk.TclError, ValueError):
+            return 3
+
+    # ---------- 画 ----------
+
+    def _render_soon(self):
+        if self._render_job is None:
+            self._render_job = self.win.after(60, self._render)
+
+    def _render(self):
+        self._render_job = None
+        if not self.win.winfo_exists():
+            return
+        self.tip.cancel()
+        self._hover_node = None
+        self.canvas.delete('all')
+        self._block_nodes.clear()
+        node = self.current()
+        self.where_label.config(text=elide_middle(self.path_of(node), 72))
+        self.back_btn.config(state='normal' if len(self.stack) > 1 else 'disabled')
+        if self.mode.get() == 'treemap':
+            self._render_treemap(node)
+        else:
+            self._render_mindmap(node)
+
+    def _canvas_size(self):
+        return self.canvas.winfo_width(), self.canvas.winfo_height()
+
+    def _render_treemap(self, node):
+        width, height = self._canvas_size()
+        if width < 40 or height < 40:
+            self._render_soon()
+            return
+        limit = self.min_size()
+        boxes = squarify([(child, child.size) for child in node.children if child.size >= limit],
+                         0.0, 0.0, float(width), float(height))
+        for index, (child, bx, by, bw, bh) in enumerate(boxes):
+            self._draw_treemap_block(child, bx, by, bw, bh, 1, index % len(self.FAMILIES), limit)
+        self.canvas.configure(scrollregion=(0, 0, width, height))
+
+    def _draw_treemap_block(self, node, x, y, width, height, level, family, limit):
+        if width < self.MIN_BLOCK_PX or height < self.MIN_BLOCK_PX:
+            return
+        rect = self.canvas.create_rectangle(x, y, x + width, y + height,
+            fill=self._fill_color(node, level, family), outline=Palette.surface, width=1)
+        self._block_nodes[rect] = node
+        header = self.px(self.HEADER_PX)
+        label = f"{node.name}  {format_size(node.size)}"
+        if width > self.px(52) and height > self.px(13):
+            self.canvas.create_text(x + self.px(4), y + self.px(2), anchor='nw',
+                text=self._fit(label, width - self.px(8)),
+                font=(FONT, 8), fill=self._text_color(node, level))
+        can_go_deeper = (node.is_dir and node.children
+                         and level < self.levels() and height > header * 2)
+        if not can_go_deeper:
+            return
+        inner = squarify([(child, child.size) for child in node.children if child.size >= limit],
+                         x, y + header, max(0.0, width), max(0.0, height - header))
+        for child, bx, by, bw, bh in inner:
+            self._draw_treemap_block(child, bx, by, bw, bh, level + 1, family, limit)
+
+    def _render_mindmap(self, node):
+        width, height = self._canvas_size()
+        if width < 40 or height < 40:
+            self._render_soon()
+            return
+        col = self.px(self.COLUMN_WIDTH)
+        box_w = col - self.px(26)
+        box_h = self.px(self.ROW_HEIGHT) - self.px(6)
+        rows = mindmap_rows(node, self.levels(), self.min_size(), float(self.px(self.ROW_HEIGHT)))
+        places = {id(item): (self.px(18) + level * col, cy)
+                  for item, level, cy in rows}
+        families = {id(node): 0}
+        counter = 0
+        for item, level, _cy in rows:                    # 先定颜色：一支一个色，深的沿用父的
+            for child in item.children:
+                if id(child) not in places:
+                    continue
+                if level == 0:
+                    families[id(child)] = counter % len(self.FAMILIES)
+                    counter += 1
+                else:
+                    families[id(child)] = families.get(id(item), 0)
+        for item, level, _cy in rows:                    # 连线画在方块底下
+            x, y = places[id(item)]
+            for child in item.children:
+                if id(child) not in places:
+                    continue
+                cx, cy = places[id(child)]
+                mid = (x + box_w + cx) / 2.0
+                thick = max(1, int(min(6, (child.size / max(1, node.size)) * 40)))
+                self.canvas.create_line(x + box_w, y, mid, y, mid, cy, cx, cy,
+                    fill='#C7CDD6', width=thick, joinstyle='miter')
+        for item, level, _cy in rows:
+            x, y = places[id(item)]
+            family = families.get(id(item), 0)
+            rect = self.canvas.create_rectangle(x, y - box_h / 2.0, x + box_w, y + box_h / 2.0,
+                fill=self._fill_color(item, level, family), outline=Palette.surface, width=1)
+            self._block_nodes[rect] = item
+            label = f"{item.name}  {format_size(item.size)}"
+            if item.is_dir:
+                label = "📁 " + label
+            self.canvas.create_text(x + self.px(6), y, anchor='w',
+                text=self._fit(label, box_w - self.px(12)),
+                font=(FONT, 8), fill=self._text_color(item, level))
+        self.canvas.configure(scrollregion=self.canvas.bbox('all') or (0, 0, width, height))
+
+    def _shade(self, level, family):
+        tones = self.FAMILIES[family % len(self.FAMILIES)]
+        return tones[0] if level <= 1 else tones[min(level - 1, 2)]
+
+    def _fill_color(self, node, level, family):
+        """文件永远用这一支最浅的那档色 —— 免得看着像"隔壁支"的。"""
+        if not node.is_dir:
+            return self.FAMILIES[family % len(self.FAMILIES)][2]
+        return self._shade(level, family)
+
+    def _text_color(self, node, level):
+        if not node.is_dir:
+            return Palette.text
+        return '#FFFFFF' if level <= 1 else Palette.text
+
+    def _fit(self, text, max_px):
+        """太长就掐成"xxxx…"：按像素算的，不是按字数。"""
+        if max_px <= 0:
+            return ''
+        if self.font.measure(text) <= max_px:
+            return text
+        out = text
+        while out and self.font.measure(out + '…') > max_px:
+            out = out[:-1]
+        return out + '…'
+
+    # ---------- 鼠标 ----------
+
+    def _node_at(self, x, y):
+        """鼠标底下是哪一块（后画的压在上面，所以倒着找）。"""
+        for item_id in reversed(self.canvas.find_overlapping(x, y, x, y)):
+            node = self._block_nodes.get(item_id)
+            if node is not None:
+                return node
+        return None
+
+    def _on_motion(self, event):
+        node = self._node_at(event.x, event.y)
+        if node is self._hover_node:
+            return
+        self._hover_node = node
+        self.tip.cancel()
+        if node is None:
+            return
+        share = node.size / max(1, self.current().size) * 100.0
+        self.tip.schedule(f"{elide_middle(self.path_of(node), 80)}\n"
+                          f"{format_size(node.size)}  ·  占这里 {share:.1f}%")
+
+    def _on_click(self, event):
+        node = self._node_at(event.x, event.y)
+        if node is None or not node.is_dir or not node.children:
+            return
+        self.stack.append(node)
+        self._render()
+
+    # ---------- 滚动条 / 关窗 ----------
+
+    def _on_yscroll(self, first, last):
+        self.scroll_y.set(first, last)
+        toggle_scrollbar(self.scroll_y, self.scroll_y.is_scrollable(), before=self.canvas,
+                         side='right', fill='y',
+                         padx=(0, self.px(2)), pady=self.px(2))
+
+    def _on_xscroll(self, first, last):
+        self.scroll_x.set(first, last)
+        toggle_scrollbar(self.scroll_x, self.scroll_x.is_scrollable(), before=self.canvas,
+                         side='bottom', fill='x',
+                         padx=self.px(2), pady=(0, self.px(2)))
+
+    def close(self):
+        self.tip.cancel()
+        if self._render_job is not None:
+            self.win.after_cancel(self._render_job)
+            self._render_job = None
+        self.gui.structure_window = None
+        self.win.destroy()
+
+
 class FolderSizeGUI:
     SLICE_SECONDS = 0.008        # 每次轮询最多占用主线程 8 毫秒，超了就下一轮接着干
     MAX_LABEL_REFRESH = 200      # 每轮最多刷新 200 个节点的文字，防止父节点太多把主线程拖住
@@ -537,9 +1034,8 @@ class FolderSizeGUI:
         self._last_click_item = ''
         self._scanning = False        # 是不是在扫（决定要不要刷标题栏那排数字）
         self._hover_item = ''         # 鼠标现在压在哪一行（悬停提示用）
-        self._tip_job = None          # 悬停提示的定时器
-        self._tip = None              # 悬停提示那个小气泡（第一次用的时候才造）
-        self._tip_label = None
+        self.tip = HoverTip(self.root, (FONT, 9))
+        self.structure_window = None  # 结构图窗口（开着就别再开第二个）
         self._pre_search_open = None  # 搜索前的展开状态，清空搜索时恢复用
         self._after_queue_label = None  # 队里这些行摆完之后，状态栏显示什么
 
@@ -713,6 +1209,8 @@ class FolderSizeGUI:
         self.expand_btn.pack(side='left')
         self.collapse_btn = self._button(bar, "收起全部", self.collapse_all, 'ghost')
         self.collapse_btn.pack(side='left', padx=(self.px(4), 0))
+        self.structure_btn = self._button(bar, "结构图", self.open_structure, 'ghost')
+        self.structure_btn.pack(side='left', padx=(self.px(12), 0))
 
         search = tk.Frame(bar, bg=Palette.surface)
         search.pack(side='right')
@@ -830,7 +1328,7 @@ class FolderSizeGUI:
         self.tree.bind("<ButtonRelease-1>", self.after_tree_click)
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
         self.tree.bind("<Motion>", self.on_tree_motion)
-        self.tree.bind("<Leave>", lambda _event: self._hide_tip())
+        self.tree.bind("<Leave>", lambda _event: self.tip.cancel())
         self.tree.bind("<<TreeviewOpen>>", self.on_tree_open)
         self.tree.bind("<<TreeviewClose>>", self.on_tree_close)
 
@@ -858,44 +1356,23 @@ class FolderSizeGUI:
         if item_id == self._hover_item:
             return
         self._hover_item = item_id
-        self._hide_tip()
+        self.tip.cancel()
         if item_id:
-            self._tip_job = self.root.after(450, self._show_tip)
+            self.tip.schedule(elide_middle(self.full_path_text(item_id), 96))
 
-    def _show_tip(self):
-        self._tip_job = None
-        relative = self.item_to_path.get(self._hover_item)
+    def full_path_text(self, item_id) -> str:
+        """某一行对应的完整路径（拿不到就返回空串）。"""
+        relative = self.item_to_path.get(item_id)
         if relative is None or not self.analyzed_path:
-            return
-        text = elide_middle(str(Path(self.analyzed_path).joinpath(*relative)), 96)
-        if self._tip is None:
-            self._tip = tk.Toplevel(self.root)
-            self._tip.overrideredirect(True)
-            self._tip.attributes('-topmost', True)
-            self._tip_label = tk.Label(self._tip, text=text, font=(FONT, 9),
-                bg=Palette.text, fg='#FFFFFF', padx=self.px(8), pady=self.px(4),
-                justify='left')
-            self._tip_label.pack()
-        else:
-            self._tip_label.config(text=text)
-        x, y = self.root.winfo_pointerxy()
-        self._tip.geometry(f"+{x + self.px(14)}+{y + self.px(18)}")
-        self._tip.deiconify()
-        self._tip.lift()
-
-    def _hide_tip(self):
-        if self._tip_job is not None:
-            self.root.after_cancel(self._tip_job)
-            self._tip_job = None
-        if self._tip is not None and self._tip.winfo_ismapped():
-            self._tip.withdraw()
+            return ""
+        return str(Path(self.analyzed_path).joinpath(*relative))
 
     # ---------- 滚动条：要才露脸 ----------
 
     def _on_tree_yscroll(self, first, last):
         """Tk 每滚一下、内容一变就会调这里。顺手判断竖直滚动条该不该露脸。"""
         self.scroll_y.set(first, last)
-        self._hide_tip()
+        self.tip.cancel()
         self._toggle_scrollbar(self.scroll_y, self.scroll_y.is_scrollable(),
                                side='right', fill='y',
                                padx=(0, self.px(2)), pady=self.px(2))
@@ -908,16 +1385,9 @@ class FolderSizeGUI:
                                padx=self.px(2), pady=(0, self.px(2)))
 
     def _toggle_scrollbar(self, bar, needed: bool, side, fill, padx, pady):
-        """该露脸就摆上，不该露就收起来（一屏装得下的时候没必要杵着一条灰杠）。
-
-        摆的时候插在列表前头 —— 不然它排在列表后头，列表就会先把地方占光，它挤不进去。
-        """
-        if needed == bool(bar.winfo_manager()):
-            return
-        if needed:
-            bar.pack(side=side, fill=fill, padx=padx, pady=pady, before=self.tree)
-        else:
-            bar.pack_forget()
+        """该露脸就摆上，不该露就收起来（一屏装得下的时候没必要杵着一条灰杠）。"""
+        toggle_scrollbar(bar, needed, before=self.tree, side=side, fill=fill,
+                         padx=padx, pady=pady)
 
     def _build_statusbar(self):
         bar = tk.Frame(self.root, bg=Palette.surface,
@@ -960,6 +1430,8 @@ class FolderSizeGUI:
             self.start_analysis(folder)
 
     def start_analysis(self, path):
+        if self.structure_window is not None:
+            self.structure_window.close()      # 重扫了，旧结构图作废
         self.analyzed_path = path
         self.current_root = None
         self.total_bytes = 0
@@ -1276,7 +1748,7 @@ class FolderSizeGUI:
 
     def on_tree_click(self, event):
         self._last_click_item = self.tree.identify_row(event.y)
-        self._hide_tip()
+        self.tip.cancel()
 
     def after_tree_click(self, event):
         """手点完之后兜个底。
@@ -1640,6 +2112,17 @@ class FolderSizeGUI:
                 close(child)
         for item in self.tree.get_children(''):
             close(item)
+
+    def open_structure(self):
+        """开结构图窗口：一张图看全局 —— 谁占地方（方块图）/ 啥结构（思维导图）。"""
+        if self.current_root is None:
+            self.scan_label.config(text="先挑一个文件夹扫完，再看结构图")
+            return
+        if self.structure_window is not None:
+            self.structure_window.win.deiconify()
+            self.structure_window.win.lift()
+            return
+        self.structure_window = StructureWindow(self)
 
     def copy_name(self):
         node = self.get_selected_node()

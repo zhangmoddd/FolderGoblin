@@ -11,7 +11,57 @@ import time
 import unittest
 from pathlib import Path
 
-from file_size_gui import AnalysisThread, FolderSizeGUI, elide_middle
+from file_size_gui import (AnalysisThread, FileNode, FolderSizeGUI, elide_middle,
+                           mindmap_rows, squarify)
+
+
+class StructureLayoutTests(unittest.TestCase):
+    """结构图的排版算法：纯计算，不开窗口也能测。"""
+
+    def test_squarify_fills_the_whole_area_and_stays_inside(self):
+        items = [('a', 50), ('b', 30), ('c', 12), ('d', 5), ('e', 2), ('f', 1)]
+        boxes = squarify(items, 0, 0, 400, 300)
+        self.assertEqual(len(boxes), len(items))
+        area = sum(w * h for _n, _x, _y, w, h in boxes)
+        self.assertAlmostEqual(area, 400 * 300, delta=1.0)
+        for _node, x, y, w, h in boxes:
+            self.assertGreaterEqual(x, -0.01)
+            self.assertGreaterEqual(y, -0.01)
+            self.assertLessEqual(x + w, 400.01)
+            self.assertLessEqual(y + h, 300.01)
+
+    def test_squarify_keeps_big_ones_big(self):
+        boxes = squarify([('大', 100), ('中', 30), ('小', 1)], 0, 0, 200, 200)
+        area = {node: w * h for node, _x, _y, w, h in boxes}
+        self.assertGreater(area['大'], area['中'])
+        self.assertGreater(area['中'], area['小'])
+
+    def test_squarify_handles_nothing_to_draw(self):
+        self.assertEqual(squarify([], 0, 0, 100, 100), [])
+        self.assertEqual(squarify([('a', 0)], 0, 0, 100, 100), [])
+
+    def test_mindmap_puts_parent_between_its_children(self):
+        folder = FileNode('a', 100, True,
+                          [FileNode('a1', 60, False), FileNode('a2', 40, False)])
+        rows = mindmap_rows(FileNode('root', 100, True, [folder]), 3, 0, 20)
+        centre = {node.name: y for node, _level, y in rows}
+        self.assertLess(centre['a1'], centre['a'])
+        self.assertLess(centre['a'], centre['a2'])
+        self.assertAlmostEqual(centre['a'], (centre['a1'] + centre['a2']) / 2.0)
+        self.assertEqual([node.name for node, _l, _y in rows][0], 'root')   # 父在前
+
+    def test_mindmap_stops_at_the_depth_limit(self):
+        mid = FileNode('mid', 1, True, [FileNode('leaf', 1, False)])
+        top = FileNode('top', 1, True, [mid])
+        rows = mindmap_rows(top, 1, 0, 20)
+        self.assertEqual([node.name for node, _l, _y in rows], ['top', 'mid'])
+
+    def test_mindmap_drops_what_is_too_small(self):
+        root = FileNode('root', 101, True, [FileNode('big', 100, False),
+                                            FileNode('tiny', 1, False)])
+        names = [node.name for node, _l, _y in mindmap_rows(root, 3, 10, 20)]
+        self.assertIn('big', names)
+        self.assertNotIn('tiny', names)
 
 
 class ElideTests(unittest.TestCase):
@@ -242,6 +292,31 @@ class PlaceholderRowTests(unittest.TestCase):
         self.assertIn('sub', text)
         self.assertIn('a.txt', text)
         self.assertIn(Path(self.tmp.name).name, text)     # 根目录也得在里头
+
+    def test_structure_window_opens_draws_and_drills(self):
+        """结构图窗口：两种模式都画得出东西，能钻进去也能退回来。"""
+        self.gui.open_structure()
+        view = self.gui.structure_window
+        self.assertIsNotNone(view)
+        view.win.update()
+        view._render()
+        self.assertGreater(len(view._block_nodes), 0, "方块图什么都没画出来")
+
+        view.set_mode('mindmap')
+        view._render()
+        self.assertGreater(len(view._block_nodes), 0, "思维导图什么都没画出来")
+
+        started_at = view.current()
+        child = next((node for node in started_at.children if node.is_dir), None)
+        self.assertIsNotNone(child)
+        view.stack.append(child)
+        view._render()
+        self.assertIs(view.current(), child)
+        view.go_back()
+        self.assertIs(view.current(), started_at)
+
+        view.close()
+        self.assertIsNone(self.gui.structure_window)
 
     def test_expand_all_and_search_leave_no_placeholder_behind(self):
         self.gui.expand_all()
