@@ -26,6 +26,8 @@ desktop.ini
 *.log
 
 # ===== 打包产物 =====
+FolderGoblin/
+FolderGoblin.exe
 FolderSizeAnalyzer/
 FolderSizeAnalyzer.exe
 *.spec

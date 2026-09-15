@@ -1,17 +1,18 @@
-# 文件夹大小分析器
+# FolderGoblin（文件夹大小分析器）
 
+**Goblin = 小妖精。** 专干一件事：揪出你硬盘里占地方的东西。
 看某个文件夹到底被什么占满了。选一个目录，它把里面每个子文件夹、每个文件占多大，从大到小排给你看。
 
 ## 怎么用
 
-1. 打开 **`FolderSizeAnalyzer` 文件夹**，双击里面的 **`FolderSizeAnalyzer.exe`**
+1. 打开 **`FolderGoblin` 文件夹**，双击里面的 **`FolderGoblin.exe`**
 2. 点"选择文件夹"，挑你要看的目录
 3. 等它扫完。列表里大的排前面，一眼看出谁最占地方
 
 不需要装 Python，也不需要装别的，双击就能跑。
 
-> ⚠️ `FolderSizeAnalyzer.exe` 和它旁边的 `_internal` 文件夹是**一整套**。
-> 要拷给别人，就把整个 `FolderSizeAnalyzer` 文件夹一起拷，只拷 exe 会打不开。
+> ⚠️ `FolderGoblin.exe` 和它旁边的 `_internal` 文件夹是**一整套**。
+> 要拷给别人，就把整个 `FolderGoblin` 文件夹一起拷，只拷 exe 会打不开。
 
 ## 有什么功能
 
@@ -146,23 +147,25 @@
 
 | 文件 | 是什么 |
 |---|---|
-| `FolderSizeAnalyzer\` | 程序本体。双击里面的 `FolderSizeAnalyzer.exe` 就能用（已打包，不需要 Python） |
-| `file_size_gui.py` | 程序源码，全部逻辑就这一个文件 |
+| `FolderGoblin\` | 程序本体。双击里面的 `FolderGoblin.exe` 就能用（已打包，不需要 Python） |
+| `folder_goblin.py` | 程序源码，全部逻辑就这一个文件 |
+| `icon.ico` | 图标（窗口 + exe 共用这一份） |
 | `start.bat` | 用源码启动（电脑装了 Python 时可用，改完代码想马上看效果就用它） |
-| `test_file_size_analyzer.py` | 自动测试，改完代码跑一下确认没改坏 |
+| `test_folder_goblin.py` | 自动测试，改完代码跑一下确认没改坏 |
 
 ## 改代码之后
 
 ```bash
 # 1. 跑测试，确认没扫坏
-python -m unittest test_file_size_analyzer
+python -m unittest test_folder_goblin
 
 # 2. 直接看效果（不打包）
-python file_size_gui.py
+python folder_goblin.py
 
-# 3. 重新打包（输出到项目根目录的 FolderSizeAnalyzer 文件夹）
-python -m PyInstaller --noconsole --onedir --name FolderSizeAnalyzer --distpath . --workpath _build_tmp --specpath _build_tmp --noconfirm file_size_gui.py
+# 3. 重新打包（输出到项目根目录的 FolderGoblin 文件夹）
+python -m PyInstaller --noconsole --onedir --name FolderGoblin --icon icon.ico --add-data "icon.ico;." --distpath . --workpath _build_tmp --noconfirm folder_goblin.py
 # 打完把里面那个旧文件夹整个替换掉
+# （注意：别加 --specpath，加了它 --add-data 的相对路径会找错地方）
 
 > ⚠️ 必须用 `--onedir`（文件夹版）。不要用 `--onefile`（单文件版）——单文件每次双击都要
 > 先把 11MB 解开摊到临时目录，启动要多等好几秒。

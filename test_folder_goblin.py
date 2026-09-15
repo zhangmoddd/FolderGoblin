@@ -1,4 +1,4 @@
-﻿"""文件夹大小分析器 - 扫描逻辑测试
+﻿"""FolderGoblin 文件夹大小分析器 - 扫描逻辑测试
 
 覆盖窗口程序里真正干活的扫描线程 AnalysisThread，
 外加列表里那些"垫底行"（占位行）的行为 —— 它上面写的必须是真的项数，不能是假的"载入中"。
@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from file_size_gui import (AnalysisThread, FileNode, FolderSizeGUI, elide_middle,
+from folder_goblin import (AnalysisThread, FileNode, FolderSizeGUI, elide_middle,
                            mindmap_rows, squarify)
 
 

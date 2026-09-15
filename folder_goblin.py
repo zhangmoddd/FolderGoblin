@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-文件夹大小分析器 - 现代浅色风格 GUI (Treeview版本，修复滚动性能)
+FolderGoblin 文件夹大小分析器 - 现代浅色风格 GUI (Treeview版本，修复滚动性能)
 """
 
 import ctypes
@@ -1437,7 +1437,7 @@ class FolderSizeGUI:
         self.scale = get_scale_factor() if self.dpi_ok else 1.0
 
         self.root = tk.Tk()
-        self.root.title("文件夹大小分析器")
+        self.root.title("FolderGoblin - 文件夹大小分析器")
         # 窗口图标：源码跑找脚本旁边的 icon.ico；打包跑找解包目录里的（打包时用 --add-data 装进去）
         for _base in (os.path.dirname(os.path.abspath(__file__)), getattr(sys, "_MEIPASS", "")):
             _ico = os.path.join(_base, "icon.ico")
@@ -1614,9 +1614,12 @@ class FolderSizeGUI:
                           padx=self.px(20), pady=self.px(14))
         header.pack(fill='x')
 
-        tk.Label(header, text="文件夹大小分析器",
+        tk.Label(header, text="FolderGoblin",
             font=(FONT, 15, 'bold'),
             fg=Palette.text, bg=Palette.surface).pack(side='left')
+        tk.Label(header, text=" 文件夹大小分析器",
+            font=(FONT, 10),
+            fg=Palette.text_muted, bg=Palette.surface).pack(side='left')
 
         stats = tk.Frame(header, bg=Palette.surface)
         stats.pack(side='right')
