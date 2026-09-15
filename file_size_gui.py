@@ -94,12 +94,19 @@ class AnalysisThread:
     def __init__(self):
         self.running = False
         self.paused = False
+        self.phase = 0          # 0=空闲 1=扫目录树 2=统计被跳过的内容
         self.thread: Optional[threading.Thread] = None
         self.result: Optional[FileNode] = None
         self.files_scanned = 0
         self.directories_scanned = 0
         self.bytes_scanned = 0
         self.errors = 0
+        self.ignore_names = set(IGNORE_DEFAULT)
+        self.skipped_bytes = 0
+        self.skipped_files = 0
+        self.skipped_dirs = 0
+        self.skipped_breakdown: Dict[str, List[int]] = {}
+        self._skipped_roots: List[tuple] = []
         self.generation = 0
         self.events = queue.SimpleQueue()
         self._pause_event = threading.Event()
@@ -120,11 +127,17 @@ class AnalysisThread:
             generation = self.generation
             self.running = True
             self.paused = False
+            self.phase = 1
             self.result = None
             self.files_scanned = 0
             self.directories_scanned = 0
             self.bytes_scanned = 0
             self.errors = 0
+            self.skipped_bytes = 0
+            self.skipped_files = 0
+            self.skipped_dirs = 0
+            self.skipped_breakdown = {}
+            self._skipped_roots = []
             self.events = queue.SimpleQueue()
             self._pending_entries = []
             self._pending_deltas = {}
@@ -183,20 +196,79 @@ class AnalysisThread:
         root = self._scan_directory(path, (), generation)
         self._flush_pending(generation)
         cancelled = not self._is_active(generation)
+        if generation != self.generation:
+            return
+
+        self.result = root
+        self.phase = 2
+        self.events.put({
+            'type': 'complete',
+            'generation': generation,
+            'root': root,
+            'cancelled': cancelled,
+            'files': self.files_scanned,
+            'directories': self.directories_scanned,
+            'bytes': self.bytes_scanned,
+            'errors': self.errors,
+        })
+
+        # 第二阶段：目录树已经交出去了，这里在后台慢慢量被忽略名单跳掉的东西有多大
+        if self._skipped_roots and self._is_active(generation):
+            self._measure_skipped(generation)
         if generation == self.generation:
-            self.result = root
+            self.events.put({
+                'type': 'skipped',
+                'generation': generation,
+                'bytes': self.skipped_bytes,
+                'files': self.skipped_files,
+                'dirs': self.skipped_dirs,
+                'stopped': not self._is_active(generation),
+                'breakdown': {name: tuple(v) for name, v in self.skipped_breakdown.items()},
+            })
+            self.phase = 0
             self.running = False
             self.paused = False
-            self.events.put({
-                'type': 'complete',
-                'generation': generation,
-                'root': root,
-                'cancelled': cancelled,
-                'files': self.files_scanned,
-                'directories': self.directories_scanned,
-                'bytes': self.bytes_scanned,
-                'errors': self.errors,
-            })
+
+    def _measure_skipped(self, generation: int):
+        """把被忽略名单跳掉的目录挨个量一遍。只累加总数，不进目录树。"""
+        for name, root_path in self._skipped_roots:
+            if not self._is_active(generation):
+                return
+            size, files, dirs = self._measure_tree(Path(root_path), generation)
+            self.skipped_bytes += size
+            self.skipped_files += files
+            self.skipped_dirs += dirs
+            bucket = self.skipped_breakdown.setdefault(name, [0, 0, 0])
+            bucket[0] += size
+            bucket[1] += files
+            bucket[2] += dirs
+
+    def _measure_tree(self, path: Path, generation: int):
+        size = 0
+        files = 0
+        dirs = 0
+        stack = [path]
+        while stack:
+            if not self._wait_if_paused(generation):
+                return size, files, dirs
+            current = stack.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_symlink():
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                dirs += 1
+                                stack.append(Path(entry.path))
+                            elif entry.is_file(follow_symlinks=False):
+                                size += entry.stat(follow_symlinks=False).st_size
+                                files += 1
+                        except (PermissionError, FileNotFoundError, OSError):
+                            self.errors += 1
+            except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+                self.errors += 1
+        return size, files, dirs
 
     def _scan_directory(self, path: Path, relative_path, generation: int) -> FileNode:
         node = FileNode(name=path.name or str(path), size=0, is_dir=True, children=[])
@@ -207,11 +279,15 @@ class AnalysisThread:
                         break
                     try:
                         name = entry.name
-                        if name in IGNORE_DEFAULT or entry.is_symlink():
+                        if entry.is_symlink():
                             continue
 
                         child_path = relative_path + (name,)
                         if entry.is_dir(follow_symlinks=False):
+                            if name in self.ignore_names:
+                                # 先记下来，等目录树扫完再单独量它有多大
+                                self._skipped_roots.append((name, entry.path))
+                                continue
                             self.directories_scanned += 1
                             self._queue_entry(relative_path, child_path, name, 0, True, generation)
                             child = self._scan_directory(Path(entry.path), child_path, generation)
@@ -434,9 +510,10 @@ class FolderSizeGUI:
 
         stats = tk.Frame(header, bg=Palette.surface)
         stats.pack(side='right')
-        # 从右往左 pack，最终显示顺序：总大小 / 项目数 / 最大深度
+        # 从右往左 pack，最终显示顺序：总大小 / 已跳过 / 项目数 / 最大深度
         self.depth_label = self._stat(stats, "最大深度", Palette.text)
         self.count_label = self._stat(stats, "项目数", Palette.text)
+        self.skipped_stat = self._stat(stats, "已跳过", Palette.text_muted)
         self.total_label = self._stat(stats, "总大小", Palette.accent)
 
     def _stat(self, parent, title, value_color):
@@ -470,6 +547,18 @@ class FolderSizeGUI:
         self.expand_btn.pack(side='left')
         self.collapse_btn = self._button(bar, "收起全部", self.collapse_all, 'ghost')
         self.collapse_btn.pack(side='left', padx=(self.px(4), 0))
+
+        self.include_var = tk.BooleanVar(value=False)
+        self.include_check = tk.Checkbutton(bar,
+            text="含缓存/依赖目录",
+            variable=self.include_var,
+            command=self.on_include_toggled,
+            bg=Palette.surface, fg=Palette.text_muted,
+            activebackground=Palette.surface, activeforeground=Palette.text,
+            selectcolor=Palette.surface,
+            font=(FONT, 10), bd=0, highlightthickness=0,
+            cursor='hand2')
+        self.include_check.pack(side='left', padx=(self.px(16), 0))
 
         search = tk.Frame(bar, bg=Palette.surface)
         search.pack(side='right')
@@ -513,7 +602,7 @@ class FolderSizeGUI:
 
         tk.Frame(stats_card, bg=Palette.border, height=1).pack(fill='x')
 
-        self.stats_text = tk.Text(stats_card,
+        self.stats_text = tk.Text(stats_card, height=10,
             bg=Palette.surface, fg=Palette.text,
             font=(MONO, 9),
             relief='flat', bd=0, highlightthickness=0,
@@ -524,6 +613,29 @@ class FolderSizeGUI:
         self.stats_text.tag_configure('name', foreground=Palette.text)
         self.stats_text.tag_configure('bar', foreground=Palette.accent)
         self.stats_text.tag_configure('num', foreground=Palette.text_muted)
+
+        # 面板下半截：被跳过的东西（不计入上面的统计）
+        tk.Frame(stats_card, bg=Palette.border, height=1).pack(fill='x')
+
+        skip_head = tk.Frame(stats_card, bg=Palette.surface)
+        skip_head.pack(fill='x', padx=self.px(14), pady=(self.px(10), self.px(2)))
+        tk.Label(skip_head, text="已跳过", font=(FONT, 11, 'bold'),
+            fg=Palette.text, bg=Palette.surface).pack(side='left')
+        self.skip_hint = tk.Label(skip_head, text="不计入上面的统计", font=(FONT, 9),
+            fg=Palette.text_muted, bg=Palette.surface)
+        self.skip_hint.pack(side='right')
+
+        self.skip_text = tk.Text(stats_card, height=8,
+            bg=Palette.surface, fg=Palette.text,
+            font=(MONO, 9),
+            relief='flat', bd=0, highlightthickness=0,
+            selectbackground=Palette.selection,
+            state='disabled', wrap='none', cursor='arrow')
+        self.skip_text.pack(fill='x', padx=self.px(14), pady=(0, self.px(10)))
+        self.skip_text.tag_configure('name', foreground=Palette.text)
+        self.skip_text.tag_configure('num', foreground=Palette.text_muted)
+        self.skip_text.tag_configure('size', foreground=Palette.accent)
+        self.skip_text.tag_configure('dim', foreground=Palette.text_soft)
 
         # 左侧目录树
         tree_card = tk.Frame(content, bg=Palette.surface,
@@ -618,9 +730,11 @@ class FolderSizeGUI:
         self.total_label.config(text="0 B")
         self.count_label.config(text="1")
         self.depth_label.config(text="0")
+        self.skipped_stat.config(text="--")
         self.scan_label.config(text="正在扫描...")
         self.path_label.config(text=path)
         self._clear_stats()
+        self._clear_skipped()
         self.browse_btn.config(state='disabled')
         self.pause_btn.config(state='normal', text="暂停")
         self.stop_btn.config(state='normal')
@@ -645,8 +759,18 @@ class FolderSizeGUI:
                 self._apply_live_batch(event)
             elif event['type'] == 'complete':
                 self.on_analysis_complete(event)
+            elif event['type'] == 'skipped':
+                self.on_skipped_measured(event)
         if self.analysis.running or events:
             self._schedule_event_poll()
+
+    def on_include_toggled(self):
+        include = self.include_var.get()
+        self.analysis.ignore_names = set() if include else set(IGNORE_DEFAULT)
+        self.include_check.config(
+            fg=Palette.accent if include else Palette.text_muted)
+        if self.analyzed_path:
+            self.start_analysis(self.analyzed_path)
 
     def _node_values(self, node: FileNode, total: int):
         total = total or self.total_bytes or node.size
@@ -734,8 +858,49 @@ class FolderSizeGUI:
         self.total_bytes = root.size
         self._adopt_final_tree(root)
         status = "已停止" if event['cancelled'] else "扫描完成"
-        error_text = f"  ·  跳过 {event['errors']} 项" if event['errors'] else ""
-        self.scan_label.config(text=f"{status}  ·  {event['files']:,} 个文件{error_text}")
+        error_text = f"  ·  读取失败 {event['errors']} 项" if event['errors'] else ""
+        if self.analysis.phase == 2:
+            self.scan_label.config(
+                text=f"{status}  ·  {event['files']:,} 个文件{error_text}  ·  正在统计被跳过的内容...")
+        else:
+            self.scan_label.config(text=f"{status}  ·  {event['files']:,} 个文件{error_text}")
+
+    def on_skipped_measured(self, event):
+        """第二阶段回来：把被忽略名单跳掉的东西摊开给用户看。"""
+        skipped = event['bytes']
+        self.skip_hint.config(text=f"{format_size(skipped)} / {event['files']:,} 个文件")
+
+        self.skip_text.config(state='normal')
+        self.skip_text.delete(1.0, 'end')
+        rows = sorted(event['breakdown'].items(), key=lambda item: -item[1][0])
+        if not rows:
+            self.skip_text.insert('end', "没有跳过任何目录\n", 'dim')
+        else:
+            for name, (size, files, _dirs) in rows:
+                label = name if len(name) <= 13 else name[:12] + '…'
+                self.skip_text.insert('end', f"{label:<14}", 'name')
+                self.skip_text.insert('end', f"{format_size(size):>10}", 'size')
+                self.skip_text.insert('end', f"{files:>10,}\n", 'num')
+            self.skip_text.insert('end', f"{'合计跳过':<14}", 'name')
+            self.skip_text.insert('end', f"{format_size(skipped):>10}", 'size')
+            self.skip_text.insert('end', f"{event['files']:>10,}\n", 'num')
+            self.skip_text.insert('end', f"{'真实总计':<14}", 'name')
+            self.skip_text.insert('end',
+                f"{format_size(self.total_bytes + skipped):>10}", 'size')
+            self.skip_text.insert('end',
+                f"{self.analysis.files_scanned + event['files']:>10,}\n", 'num')
+        self.skip_text.config(state='disabled')
+
+        if skipped:
+            self.skipped_stat.config(text=format_size(skipped))
+        else:
+            self.skipped_stat.config(text="无")
+
+        if not event.get('stopped'):
+            status = "扫描完成" if skipped else "扫描完成（全部计入，没有跳过）"
+            self.scan_label.config(
+                text=f"{status}  ·  {self.analysis.files_scanned:,} 个文件  ·  "
+                     f"另有 {format_size(skipped)} 被跳过")
 
     def _adopt_final_tree(self, root):
         node_count = 0
@@ -801,6 +966,13 @@ class FolderSizeGUI:
         self.stats_text.config(state='normal')
         self.stats_text.delete(1.0, 'end')
         self.stats_text.config(state='disabled')
+
+    def _clear_skipped(self):
+        self.skip_text.config(state='normal')
+        self.skip_text.delete(1.0, 'end')
+        self.skip_text.insert('end', "扫描完成后在这里显示\n", 'dim')
+        self.skip_text.config(state='disabled')
+        self.skip_hint.config(text="不计入上面的统计")
 
     def update_file_stats(self, root):
         stats = {}
