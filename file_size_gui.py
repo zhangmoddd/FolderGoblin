@@ -144,6 +144,7 @@ class AnalysisThread:
         self._lock = threading.Lock()
         self._pending_entries = []
         self._pending_deltas = {}
+        self._pending_counts = {}
         self._last_flush = 0.0
         self._entry_tick = 0
 
@@ -170,6 +171,7 @@ class AnalysisThread:
             self.events = queue.SimpleQueue()
             self._pending_entries = []
             self._pending_deltas = {}
+            self._pending_counts = {}
             self._last_flush = time.monotonic()
             self._entry_tick = 0
             self._stop_event.clear()
@@ -198,6 +200,9 @@ class AnalysisThread:
             return
         pending = self._pending_entries
         pending.append((parent_path, node_path, name, size, is_dir))
+        # 顺手记一笔"这个文件夹里数到了几项"，界面拿它当占位行上的真数字
+        counts = self._pending_counts
+        counts[parent_path] = counts.get(parent_path, 0) + 1
         if not is_dir:
             self._pending_deltas[parent_path] = self._pending_deltas.get(parent_path, 0) + size
         count = len(pending)
@@ -214,6 +219,7 @@ class AnalysisThread:
             'generation': generation,
             'entries': self._pending_entries,
             'deltas': self._pending_deltas,
+            'counts': self._pending_counts,
             'files': self.files_scanned,
             'directories': self.directories_scanned,
             'bytes': self.bytes_scanned,
@@ -221,6 +227,7 @@ class AnalysisThread:
         }
         self._pending_entries = []
         self._pending_deltas = {}
+        self._pending_counts = {}
         self._last_flush = time.monotonic()
         self.events.put(event)
 
@@ -344,7 +351,6 @@ class AnalysisThread:
 class FolderSizeGUI:
     SLICE_SECONDS = 0.008        # 每次轮询最多占用主线程 8 毫秒，超了就下一轮接着干
     MAX_LABEL_REFRESH = 200      # 每轮最多刷新 200 个节点的文字，防止父节点太多把主线程拖住
-    PLACEHOLDER = '载入中…'       # 垫在文件夹下面的占位行，专门为了让展开箭头画出来
 
     def __init__(self):
         self.dpi_ok = enable_dpi_awareness()
@@ -381,9 +387,9 @@ class FolderSizeGUI:
         self._open_paths = {()}       # 哪些文件夹是展开的（() 就是根）
         self._node_override = {}      # 点开文件夹时，把真正的节点对象带给摆行的那段代码
         self._open_on_insert = set()  # 这些路径的行摆上时要直接展开（搜索、展开全部用）
-        self._placeholder_of = {}     # 文件夹行 -> 它下面那条占位行
+        self._placeholder_of = {}     # 文件夹路径 -> 它下面垫的那条占位行（为了画出展开箭头）
+        self._child_counts = {}       # 文件夹路径 -> 里面已经数到几项（占位行上就写这个真数）
         self._last_click_item = ''
-        self._placeholder_of = {}     # 文件夹行 -> 它下面那条占位行
         self._scanning = False        # 是不是在扫（决定要不要刷标题栏那排数字）
         self._pre_search_open = None  # 搜索前的展开状态，清空搜索时恢复用
         self._after_queue_label = None  # 队里这些行摆完之后，状态栏显示什么
@@ -743,6 +749,7 @@ class FolderSizeGUI:
         self._stopping = False
         self._finished = False
         self._deferred = {}
+        self._child_counts = {}
         self._open_paths = {()}
         self._node_override = {}
         self._open_on_insert = set()
@@ -800,6 +807,9 @@ class FolderSizeGUI:
                 deltas = self._queue_deltas
                 for parent_path, delta in event['deltas'].items():
                     deltas[parent_path] = deltas.get(parent_path, 0) + delta
+                counts = self._child_counts
+                for parent_path, number in (event.get('counts') or {}).items():
+                    counts[parent_path] = counts.get(parent_path, 0) + number
                 self._last_stats = event
             elif event['type'] == 'complete':
                 self._pending_complete = event
@@ -821,6 +831,10 @@ class FolderSizeGUI:
 
         if self._queue_entries or self.analysis.running or events:
             self._schedule_event_poll(idle=True)
+        elif self._scanning and not self.analysis.events.empty():
+            # 扫描线程说自己跑完了，但"完成"事件刚好在这几毫秒里才塞进队列 —— 下一轮再收尾。
+            # 不然状态栏会一直挂着"正在扫描"，数字和类型统计也永远不落地。
+            self._schedule_event_poll(idle=True)
         else:
             self._finished = True
             if self._after_queue_label:
@@ -834,6 +848,22 @@ class FolderSizeGUI:
 
     def _node_tags(self, node: FileNode):
         return ('dir' if node.is_dir else 'file',)
+
+    def _placeholder_label(self, path, exact: Optional[int] = None) -> str:
+        """占位行上写什么字。
+
+        这条行不是给你看的进度条，是 Tk 8.6 的老规矩：一个文件夹"底下有没有东西"，
+        只看它下面挂没挂子行 —— 不垫一条，展开箭头就画不出来。
+        平时它是藏着的（父文件夹收着就看不见），点开的那一下真内容立刻摆上来，它就被撤了。
+        所以真被看到的时候，写的必须是真话：这个文件夹里有多少项 ——
+        扫描已经数出来的就写数出来的，实在还没数到才写"正在扫描"。
+        """
+        if exact is not None:
+            return f"{exact:,} 项"
+        number = self._child_counts.get(path)
+        if number:
+            return f"{number:,} 项"
+        return '正在扫描…' if self._scanning else '空'
 
     def _insert_slice(self, deadline):
         """把排队的条目往列表里摆，摆到这一片的时间用完为止。
@@ -865,6 +895,8 @@ class FolderSizeGUI:
                 deferred.setdefault(parent_path, []).append((name, size, is_dir))
                 continue
             node = overrides.pop(node_path, None)
+            # 拿到真节点 = 它里面有几项是准数（搜索/展开全部重摆时走这条）
+            exact = len(node.children) if node is not None else None
             if node is None:
                 node = FileNode(name, size, is_dir)
             item_id = self.tree.insert(parent_id, 'end', text=name,
@@ -873,14 +905,15 @@ class FolderSizeGUI:
             path_to_item[node_path] = item_id
             self.item_to_path[item_id] = node_path
             self.item_to_node[item_id] = node
-            # 真内容进来了，父文件夹下面那条占位行可以撤了
-            ph = placeholders.pop(parent_id, None)
+            # 真内容进来了，父文件夹底下那条占位行可以撤了
+            ph = placeholders.pop(parent_path, None)
             if ph is not None:
                 self.tree.delete(ph)
-            if is_dir and node_path not in placeholders:
-                # 文件夹下面先垫一条占位行，Tk 才会画出展开箭头
+            # 底下垫一条占位行，展开箭头才画得出来；里面确实是空的就不用垫了
+            if is_dir and exact != 0 and node_path not in placeholders:
                 placeholders[node_path] = self.tree.insert(item_id, 'end',
-                    text=self.PLACEHOLDER, values=('', ''), tags=('placeholder',))
+                    text=self._placeholder_label(node_path, exact),
+                    values=('', ''), tags=('placeholder',))
             depth = len(node_path)
             if depth > self.live_max_depth:
                 self.live_max_depth = depth
@@ -917,8 +950,7 @@ class FolderSizeGUI:
         return added
 
     def on_tree_open(self, event):
-        item_id = self.tree.focus() or self._last_click_item
-        path = self.item_to_path.get(item_id)
+        path = self._just_opened_path()
         if path is None:
             return
         self._open_paths.add(path)
@@ -926,12 +958,38 @@ class FolderSizeGUI:
             self._finished = False
             self._schedule_event_poll(idle=True)
         else:
-            # 里面确实没东西，把占位行撤掉，箭头也就跟着消失
-            node = self.item_to_node.get(item_id)
+            # 里面确实没东西：把占位行撤掉，箭头也就跟着消失
+            node = self.item_to_node.get(self.path_to_item.get(path))
             if node is None or not node.children:
-                ph = self._placeholder_of.pop(item_id, None)
-                if ph is not None:
-                    self.tree.delete(ph)
+                self._drop_placeholder(path)
+
+    def _just_opened_path(self):
+        """刚被展开的是哪个文件夹。
+
+        点箭头的时候，键盘焦点可能停在别的行上（比如它底下那条占位行），
+        所以不能只看 focus()：先认"刚点过的那行"，再认"列表里已经打开、但还没登记过的行"，
+        最后才认 focus()。三条都认不出来就当没这回事。
+        """
+        for item_id in (self._last_click_item, self.tree.focus()):
+            if self._is_open_row(item_id):
+                path = self.item_to_path.get(item_id)
+                if path is not None and path not in self._open_paths:
+                    return path
+        for item_id, path in self.item_to_path.items():
+            if path not in self._open_paths and self._is_open_row(item_id):
+                return path
+        return None
+
+    def _is_open_row(self, item_id) -> bool:
+        if not item_id or item_id not in self.item_to_path:
+            return False
+        return bool(self.tree.item(item_id, 'open'))
+
+    def _drop_placeholder(self, path):
+        """撤掉某个文件夹底下垫着的那条占位行。"""
+        ph = self._placeholder_of.pop(path, None)
+        if ph is not None:
+            self.tree.delete(ph)
 
     def on_tree_close(self, event):
         path = self.item_to_path.get(self.tree.focus())
@@ -990,9 +1048,11 @@ class FolderSizeGUI:
         self.item_to_node[root_id] = root if root else root_node
         self.path_to_item[()] = root_id
         self.item_to_path[root_id] = ()
-        # 根下面也先垫一条，等真行摆上来就撤掉
-        self._placeholder_of[()] = self.tree.insert(root_id, 'end',
-            text=self.PLACEHOLDER, values=('', ''), tags=('placeholder',))
+        # 根下面也先垫一条（展开箭头），等真行摆上来就撤掉
+        if root is not None and root.children:
+            self._placeholder_of[()] = self.tree.insert(root_id, 'end',
+                text=self._placeholder_label((), len(root.children)),
+                values=('', ''), tags=('placeholder',))
 
     def _apply_queued_deltas(self):
         """把攒下来的大小加到各级父节点上。数字全加，但标签每轮最多刷 200 个。"""
@@ -1148,10 +1208,14 @@ class FolderSizeGUI:
             item_to_node[item_id] = node
             tree.item(item_id, text=node.name,
                 values=self._node_values(node, total), tags=self._node_tags(node))
-            if not node.children:
-                # 空文件夹：把占位行撤了，省得它一直显示"载入中"
-                ph = self._placeholder_of.pop(item_id, None)
-                if ph is not None:
+            ph = self._placeholder_of.get(rel_path)
+            if ph is not None:
+                if node.children:
+                    # 扫完了就有准数：占位行改写成"里面有多少项"
+                    tree.item(ph, text=self._placeholder_label(rel_path, len(node.children)))
+                else:
+                    # 空文件夹：把占位行撤了，箭头也就跟着消失
+                    del self._placeholder_of[rel_path]
                     tree.delete(ph)
             desired = []
             for child in node.children:
@@ -1162,7 +1226,9 @@ class FolderSizeGUI:
                 desired.append(child_id)
                 adopt(child, child_path)
             # 顺序本来就对就不动 —— 否则要为每个节点白调一次 Tcl
-            if desired and tuple(desired) != tree.get_children(item_id):
+            # （比的时候把垫底那条占位行排除掉，它本来就不该算在"内容"里）
+            if desired and tuple(desired) != tuple(
+                    row for row in tree.get_children(item_id) if row != ph):
                 for index, child_id in enumerate(desired):
                     tree.move(child_id, item_id, index)
 
