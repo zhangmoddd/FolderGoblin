@@ -814,10 +814,20 @@ class StructureWindow:
         return self.stack[-1]
 
     def path_of(self, node) -> str:
-        """这个节点在磁盘上的完整路径（靠钻进来的这条链拼出来）。"""
-        parts = [item.name for item in self.stack[1:]]
-        if node is not self.current():
-            parts.append(node.name)
+        """这个节点在磁盘上的完整路径。
+
+        从这块往回沿"装着它的文件夹"链一路走到当前根，把名字倒序串起来。
+        以前只拼"钻进来的链 + 这块自己的名字"，深层的块中间几层全被吞了 ——
+        备忘录深处的 build-script-build.exe 就被报成了直接躺在 codex 根上，
+        资源管理器里照着找根本找不到。
+        """
+        chain = []
+        walker = node
+        while walker is not None and walker is not self.current():
+            chain.append(walker.name)
+            walker = self._block_parents.get(id(walker))
+        chain.reverse()
+        parts = [item.name for item in self.stack[1:]] + chain
         base = self.gui.analyzed_path or ''
         return str(Path(base).joinpath(*parts)) if parts else base
 
@@ -1037,6 +1047,7 @@ class StructureWindow:
             for child in item.children:
                 if id(child) not in places:
                     continue
+                self._block_parents[id(child)] = item
                 if level == 0:
                     families[id(child)] = counter % len(self.FAMILIES)
                     counter += 1
