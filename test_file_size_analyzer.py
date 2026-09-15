@@ -40,11 +40,14 @@ class StructureLayoutTests(unittest.TestCase):
         self.assertEqual(squarify([], 0, 0, 100, 100), [])
         self.assertEqual(squarify([('a', 0)], 0, 0, 100, 100), [])
 
-    def test_mindmap_puts_parent_between_its_children(self):
+    def test_mindmap_pins_root_on_top_and_keeps_parent_between_children(self):
+        """根节点钉在最上面（一开图就是"根 → 最大的几支"）；
+        底下的节点还是夹在自己孩子们的正中间。"""
         folder = FileNode('a', 100, True,
                           [FileNode('a1', 60, False), FileNode('a2', 40, False)])
         rows = mindmap_rows(FileNode('root', 100, True, [folder]), 3, 0, 20)
         centre = {node.name: y for node, _level, y in rows}
+        self.assertEqual(centre['root'], 10)                       # 根在最上面
         self.assertLess(centre['a1'], centre['a'])
         self.assertLess(centre['a'], centre['a2'])
         self.assertAlmostEqual(centre['a'], (centre['a1'] + centre['a2']) / 2.0)

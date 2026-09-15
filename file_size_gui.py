@@ -193,11 +193,12 @@ def _take_row(items, side, scale):
 
 
 def mindmap_rows(root, max_depth, min_size, row_height, collapsed=None):
-    """思维导图排版：一层占一列，从上往下铺。
+    """思维导图排版：根节点钉在最上面，下面一层占一列、从上往下铺。
 
     返回 [(节点, 第几层, 中心 y), ...]，父在前、子在后，照着顺序画就行。
-    地盘大的排前面（跟列表里一个顺序）。
-    collapsed 里放着的节点当成"收起来了"，它下面的就不铺（省得全铺开看不过来）。
+    地盘大的排前面（跟列表里一个顺序）—— 一打开图，最大的那几支先入眼。
+    根节点不跟着孩子居中，就钉在顶上 —— 不然图一高，根就跑到屏幕外面去了。
+    collapsed 里放着的节点当成"收起来了"，它下面的就不铺。
     """
     rows = []
     cursor = [row_height / 2.0]
@@ -212,6 +213,8 @@ def mindmap_rows(root, max_depth, min_size, row_height, collapsed=None):
         else:
             centre_y = cursor[0]
             cursor[0] += row_height
+        if level == 0:
+            centre_y = row_height / 2.0            # 根节点钉在最上面
         rows.append((node, level, centre_y))
         return centre_y
 
@@ -704,7 +707,7 @@ class StructureWindow:
         self.win.minsize(self.px(760), self.px(480))
         self.win.protocol('WM_DELETE_WINDOW', self.close)
         self._build()
-        self.win.after(80, self._render)
+        self.win.after(80, lambda: self._render(focus='top'))
 
     def px(self, value: float) -> int:
         return max(1, int(round(value * self.scale)))
@@ -728,7 +731,7 @@ class StructureWindow:
         tk.Label(bar, text="画到第", font=(FONT, 9), fg=Palette.text_muted,
                  bg=Palette.surface).pack(side='left')
         tk.Spinbox(bar, from_=1, to=8, width=2, textvariable=self.depth,
-            command=self._render, font=(FONT, 9), justify='center',
+            command=lambda: self._render(focus='top'), font=(FONT, 9), justify='center',
             relief='flat', bg=Palette.surface_alt, fg=Palette.text,
             buttonbackground=Palette.surface_alt, highlightthickness=1,
             highlightbackground=Palette.border).pack(side='left', padx=self.px(4))
@@ -738,7 +741,7 @@ class StructureWindow:
         tk.Label(bar, text="小于", font=(FONT, 9), fg=Palette.text_muted,
                  bg=Palette.surface).pack(side='left', padx=(self.px(14), 0))
         tk.Spinbox(bar, from_=self.MIN_SHARE, to=50, increment=0.1, width=4, textvariable=self.min_share,
-            command=self._render, font=(FONT, 9), justify='center',
+            command=lambda: self._render(focus='top'), font=(FONT, 9), justify='center',
             relief='flat', bg=Palette.surface_alt, fg=Palette.text,
             buttonbackground=Palette.surface_alt, highlightthickness=1,
             highlightbackground=Palette.border).pack(side='left', padx=self.px(4))
@@ -760,7 +763,7 @@ class StructureWindow:
 
         self.canvas = tk.Canvas(card, bg=Palette.surface, highlightthickness=0, bd=0)
         self.canvas.pack(fill='both', expand=True)
-        self.canvas.bind('<Configure>', lambda _event: self._render_soon(center=False))
+        self.canvas.bind('<Configure>', lambda _event: self._render_soon(focus=None))
         self.canvas.bind('<Motion>', self._on_motion)
         self.canvas.bind('<Leave>', self._on_leave)
         self.canvas.bind('<Button-1>', self._on_click)
@@ -798,7 +801,7 @@ class StructureWindow:
             self.mode.set(mode)
             self._refresh_mode_buttons()
             self._refresh_hint()
-            self._render()
+            self._render(focus='top')
 
     def go_back(self):
         if len(self.stack) > 1:
@@ -838,16 +841,16 @@ class StructureWindow:
 
     # ---------- 画 ----------
 
-    def _render_soon(self, center=True):
+    def _render_soon(self, focus='top'):
         if self._render_job is None:
-            self._render_job = self.win.after(60, lambda: self._render(center=center))
+            self._render_job = self.win.after(60, lambda: self._render(focus=focus))
 
-    def _render(self, center=True):
+    def _render(self, focus='center'):
         """重画整张图。
 
-        center=True 时画完把根节点摆到画面正中（开图、钻进去、改旋钮就用这个）；
-        缩放、收放节点这些"手在图上动"的操作要传 False —— 它们自己会把手底下的东西对回原位，
-        两边都挪就会看到画面来回跳。
+        focus='center'：画完把当前根节点摆到画面正中（钻进去、退回来就用这个）；
+        focus='top'：把根节点摆在左上角，最大的那几支先入眼（开图、改旋钮用这个）；
+        focus=None：画面一动不动（缩放、收放节点 —— 它们自己会把手底下的东西对回原位）。
         """
         self._render_job = None
         if not self.win.winfo_exists():
@@ -867,18 +870,29 @@ class StructureWindow:
             self._render_treemap(node)
         else:
             self._render_mindmap(node)
-            if center:
-                # 导图把根节点摆在整张图正中，图一高根就跑到屏幕外了 —— 手动挪到画面中间
+            if focus == 'center':
+                # 导图把根节点摆在整张图正中，钻进去的时候先让人看见自己在哪
                 self._center_on(node)
+            elif focus == 'top':
+                # 开图 / 改旋钮：根节点摆到左上角，最大的那几支先入眼
+                self._show_from_top(node)
 
     def _center_on(self, node):
-        """把某个方块挪到画面正中：开图、钻进去的时候，先让人看见自己在哪。"""
+        """把某个方块挪到画面正中：钻进去的时候，先让人看见自己在哪。"""
         rect = self._block_rects.get(id(node))
         if rect is None:
             return
         x, y, width, height = rect
         self._scroll_to(x + width / 2.0 - self.canvas.winfo_width() / 2.0,
                         y + height / 2.0 - self.canvas.winfo_height() / 2.0)
+
+    def _show_from_top(self, node):
+        """把某个方块挪到画面左上角：开图的时候，最大的那几支先入眼。"""
+        rect = self._block_rects.get(id(node))
+        if rect is None:
+            return
+        x, y, _width, _height = rect
+        self._scroll_to(x - self.px(40), y - self.px(80))
 
     def _canvas_size(self):
         return self.canvas.winfo_width(), self.canvas.winfo_height()
@@ -1020,7 +1034,7 @@ class StructureWindow:
             self.collapsed.discard(key)
         else:
             self.collapsed.add(key)
-        self._render(center=False)
+        self._render(focus=None)
         rect = self._block_rects.get(id(node))
         if screen is not None and rect is not None:
             self._scroll_to(rect[0] - screen[0], rect[1] - screen[1])
@@ -1099,7 +1113,7 @@ class StructureWindow:
         self._zoom_job = None
         anchor = self._pending_anchor
         self._pending_anchor = None
-        self._render(center=False)
+        self._render(focus=None)
         if anchor is not None:
             node, rel_x, rel_y, win_x, win_y = anchor
             rect = self._block_rects.get(id(node))
