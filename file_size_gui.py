@@ -93,7 +93,7 @@ class AnalysisThread:
 
     BATCH_ENTRY_LIMIT = 256
     BATCH_INTERVAL = 0.12
-    PAUSE_CHECK_EVERY = 512      # 每扫这么多项才查一次"暂停/停止"，省下几十万次加锁
+    PAUSE_CHECK_EVERY = 128      # 每扫这么多项才查一次"暂停/停止"，省下几十万次加锁
     CLOCK_CHECK_EVERY = 32       # 每攒这么多项才看一次表，省下几十万次取时间
 
     def __init__(self):
@@ -106,6 +106,8 @@ class AnalysisThread:
         self.bytes_scanned = 0
         self.errors = 0
         self.symlinks_skipped = 0
+        self.max_depth = 0
+        self.ext_stats: Dict[str, List[int]] = {}
         self.generation = 0
         self.events = queue.SimpleQueue()
         self._pause_event = threading.Event()
@@ -133,6 +135,8 @@ class AnalysisThread:
             self.bytes_scanned = 0
             self.errors = 0
             self.symlinks_skipped = 0
+            self.max_depth = 0
+            self.ext_stats = {}
             self.events = queue.SimpleQueue()
             self._pending_entries = []
             self._pending_deltas = {}
@@ -216,12 +220,17 @@ class AnalysisThread:
                 'bytes': self.bytes_scanned,
                 'errors': self.errors,
                 'symlinks': self.symlinks_skipped,
+                'depth': self.max_depth,
+                'stats': self.ext_stats,
             })
             self.running = False
             self.paused = False
 
     def _scan_directory(self, path: Path, relative_path, generation: int) -> FileNode:
         node = FileNode(name=path.name or str(path), size=0, is_dir=True, children=[])
+        depth = len(relative_path)
+        if depth > self.max_depth:
+            self.max_depth = depth
         try:
             with os.scandir(path) as entries:
                 for entry in entries:
@@ -252,6 +261,14 @@ class AnalysisThread:
                             self.files_scanned += 1
                             self.bytes_scanned += size
                             self._queue_entry(relative_path, child_path, name, size, False, generation)
+                            # 顺手把"文件类型统计"攒出来，省得界面扫完再走一遍 27 万个文件
+                            dot = name.rfind('.')
+                            ext = name[dot + 1:].lower() if dot >= 0 else 'no_ext'
+                            bucket = self.ext_stats.get(ext)
+                            if bucket is None:
+                                bucket = self.ext_stats[ext] = [0, 0]
+                            bucket[0] += 1
+                            bucket[1] += size
                     except (PermissionError, FileNotFoundError, OSError):
                         self.errors += 1
         except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
@@ -320,6 +337,14 @@ class FolderSizeGUI:
         self._pending_complete = None # 扫描线程已干完，等界面把队排空再收尾
         self._stopping = False
         self._finished = True         # 本轮收尾（摆完结果、放开按钮）做完了吗
+        self._deferred = {}           # 父文件夹没展开的条目先存这儿，等展开再摆
+        self._open_paths = {()}       # 哪些文件夹是展开的（() 就是根）
+        self._node_override = {}      # 点开文件夹时，把真正的节点对象带给摆行的那段代码
+        self._open_new_rows = False   # 新摆上的行要不要直接展开（搜索用）
+        self._last_click_item = ''
+        self._scanning = False        # 是不是在扫（决定要不要刷标题栏那排数字）
+        self._pre_search_open = None  # 搜索前的展开状态，清空搜索时恢复用
+        self._after_queue_label = None  # 队里这些行摆完之后，状态栏显示什么
 
         self.setup_styles()
         self.create_widgets()
@@ -614,6 +639,9 @@ class FolderSizeGUI:
         self.tree.tag_configure('file', foreground=Palette.text_muted, font=(FONT, 10))
 
         self.tree.bind("<Button-3>", self.show_context_menu)
+        self.tree.bind("<Button-1>", self.on_tree_click)
+        self.tree.bind("<<TreeviewOpen>>", self.on_tree_open)
+        self.tree.bind("<<TreeviewClose>>", self.on_tree_close)
 
     def _build_statusbar(self):
         bar = tk.Frame(self.root, bg=Palette.surface,
@@ -670,6 +698,13 @@ class FolderSizeGUI:
         self._pending_complete = None
         self._stopping = False
         self._finished = False
+        self._deferred = {}
+        self._open_paths = {()}
+        self._node_override = {}
+        self._open_new_rows = False
+        self._scanning = True
+        self._pre_search_open = None
+        self._after_queue_label = None
 
         root_node = FileNode(Path(path).name or str(path), 0, True)
         root_id = self.tree.insert('', 'end', text=root_node.name,
@@ -728,16 +763,24 @@ class FolderSizeGUI:
 
         self._insert_slice(deadline)
         self._apply_queued_deltas()
-        self._refresh_header()
 
-        backlog = bool(self._queue_entries)
-        if self._pending_complete is not None and not backlog:
+        if self._pending_complete is not None and not self._queue_entries:
             event = self._pending_complete
             self._pending_complete = None
             self.on_analysis_complete(event)
-        elif self.analysis.running or events or backlog or not self._finished:
-            # 只要本轮还没收尾，就继续轮询 —— 免得刚好赶上线程换标记那一瞬间，收尾被漏掉
-            self._schedule_event_poll(idle=backlog, delay=10 if backlog else 60)
+
+        if self._scanning:
+            self._refresh_header()
+        if not self._queue_entries:
+            self._open_new_rows = False
+
+        if self._queue_entries or self.analysis.running or events:
+            self._schedule_event_poll(idle=True)
+        else:
+            self._finished = True
+            if self._after_queue_label:
+                self.scan_label.config(text=self._after_queue_label)
+                self._after_queue_label = None
 
     def _node_values(self, node: FileNode, total: int):
         total = total or self.total_bytes or node.size
@@ -748,23 +791,38 @@ class FolderSizeGUI:
         return ('dir' if node.is_dir else 'file',)
 
     def _insert_slice(self, deadline):
-        """把排队的节点往树里塞，塞到这一片的时间用完为止。剩下的下一轮接着塞。"""
+        """把排队的条目往列表里摆，摆到这一片的时间用完为止。
+
+        只摆"父文件夹已经展开"的条目 —— 折叠着看不见的行，摆了也是白摆。
+        这是提速的关键：扫描时真正要摆的只有顶层那几十行，剩下的等点开再摆。
+        """
         entries = self._queue_entries
         path_to_item = self.path_to_item
+        open_paths = self._open_paths
+        deferred = self._deferred
+        overrides = self._node_override
         total = len(entries)
         index = 0
         while index < total and time.monotonic() < deadline:
             parent_path, node_path, name, size, is_dir = entries[index]
             index += 1
             if node_path in path_to_item:
+                overrides.pop(node_path, None)
+                continue
+            if parent_path not in open_paths:
+                deferred.setdefault(parent_path, []).append((name, size, is_dir))
                 continue
             parent_id = path_to_item.get(parent_path)
             if parent_id is None:
+                # 父行还没摆上，先存着，别丢了
+                deferred.setdefault(parent_path, []).append((name, size, is_dir))
                 continue
-            node = FileNode(name, size, is_dir)
+            node = overrides.pop(node_path, None)
+            if node is None:
+                node = FileNode(name, size, is_dir)
             item_id = self.tree.insert(parent_id, 'end', text=name,
                 values=self._node_values(node, self.total_bytes),
-                tags=self._node_tags(node))
+                tags=self._node_tags(node), open=self._open_new_rows)
             path_to_item[node_path] = item_id
             self.item_to_path[item_id] = node_path
             self.item_to_node[item_id] = node
@@ -773,6 +831,101 @@ class FolderSizeGUI:
                 self.live_max_depth = depth
         if index:
             del entries[:index]
+
+    def _load_children(self, path):
+        """把一个文件夹的下一层排进队，等主线程分片摆上去。返回排了几条。"""
+        parent_id = self.path_to_item.get(path)
+        if parent_id is None:
+            return 0
+        queued = self._queue_entries
+        added = 0
+        pending = self._deferred.pop(path, None)
+        if pending:
+            # 扫描还没走完，先用手头暂存的
+            for name, size, is_dir in pending:
+                child_path = path + (name,)
+                if child_path in self.path_to_item:
+                    continue
+                queued.append((path, child_path, name, size, is_dir))
+                added += 1
+            return added
+        # 扫描已经完事，直接用最终结果里的
+        node = self.item_to_node.get(parent_id)
+        if node is not None:
+            for child in node.children:
+                child_path = path + (child.name,)
+                if child_path in self.path_to_item:
+                    continue
+                queued.append((path, child_path, child.name, child.size, child.is_dir))
+                self._node_override[child_path] = child
+                added += 1
+        return added
+
+    def on_tree_open(self, event):
+        item_id = self.tree.focus() or self._last_click_item
+        path = self.item_to_path.get(item_id)
+        if path is None:
+            return
+        self._open_paths.add(path)
+        if self._load_children(path):
+            self._finished = False
+            self._schedule_event_poll(idle=True)
+
+    def on_tree_close(self, event):
+        path = self.item_to_path.get(self.tree.focus())
+        if path is not None:
+            self._open_paths.discard(path)
+
+    def on_tree_click(self, event):
+        self._last_click_item = self.tree.identify_row(event.y)
+
+    def _collect_visible(self, open_paths):
+        """按"哪些文件夹是展开的"，算出该显示哪些行，从浅到深排好。"""
+        rows = []
+        stack = [(self.current_root, ())]
+        while stack:
+            node, rel_path = stack.pop()
+            for child in node.children:
+                child_path = rel_path + (child.name,)
+                rows.append((len(child_path), child_path, rel_path, child))
+                if child.is_dir and child_path in open_paths:
+                    stack.append((child, child_path))
+        rows.sort(key=lambda row: row[0])
+        return rows
+
+    def _rebuild_lazy(self, open_paths):
+        """把列表清空重摆：只摆 open_paths 里那些文件夹的下一层。"""
+        self._rebuild_lazy_from(self._collect_visible(open_paths), open_paths)
+
+    def _rebuild_lazy_from(self, rows, open_paths):
+        self._reset_tree()
+        self._open_paths = set(open_paths) | {()}
+        self._open_new_rows = True
+        queued = self._queue_entries
+        for _depth, child_path, rel_path, child in rows:
+            queued.append((rel_path, child_path, child.name, child.size, child.is_dir))
+            self._node_override[child_path] = child
+        self._finished = False
+        self._schedule_event_poll(idle=True)
+
+    def _reset_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        self.item_to_node.clear()
+        self.path_to_item.clear()
+        self.item_to_path.clear()
+        self._queue_entries = []
+        self._node_override.clear()
+        self._deferred = {}
+        self.live_max_depth = 0
+        root = self.current_root
+        name = root.name if root else ''
+        root_node = FileNode(name, root.size if root else 0, True)
+        root_id = self.tree.insert('', 'end', text=name,
+            values=self._node_values(root_node, root.size if root else 1),
+            tags=('dir',), open=True)
+        self.item_to_node[root_id] = root if root else root_node
+        self.path_to_item[()] = root_id
+        self.item_to_path[root_id] = ()
 
     def _apply_queued_deltas(self):
         """把攒下来的大小加到各级父节点上。数字全加，但标签每轮最多刷 200 个。"""
@@ -851,12 +1004,35 @@ class FolderSizeGUI:
         self.current_root = root
         self.total_bytes = root.size
         self._adopt_final_tree(root)
+        self.total_label.config(text=format_size(root.size))
+        self.count_label.config(text=f"{event['files'] + event['directories']:,}")
+        self.depth_label.config(text=str(event.get('depth', 0)))
+        self._render_stats(event.get('stats') or {})
         status = "已停止" if event['cancelled'] else "扫描完成"
         error_text = f"  ·  读取失败 {event['errors']} 项" if event['errors'] else ""
         self.scan_label.config(text=f"{status}  ·  {event['files']:,} 个文件{error_text}")
         self._fill_uncounted(event.get('symlinks', 0), event['errors'])
         self._stopping = False
-        self._finished = True
+        self._scanning = False
+
+    def _render_stats(self, ext_stats):
+        """把扫描线程顺手攒好的"文件类型统计"画出来。"""
+        rows = sorted(ext_stats.items(), key=lambda kv: kv[1][1], reverse=True)[:20]
+        max_size = rows[0][1][1] if rows else 1
+        self.stats_text.config(state='normal')
+        self.stats_text.delete(1.0, 'end')
+        for ext, data in rows:
+            count, size = data[0], data[1]
+            bar_len = max(1, int(size / max_size * 12))
+            label = '.' + ext
+            if len(label) > 9:
+                label = label[:8] + '…'
+            self.stats_text.insert('end', f"{label:<9}", 'name')
+            self.stats_text.insert('end', "█" * bar_len, 'bar')
+            self.stats_text.insert('end', " " * (13 - bar_len), 'bar')
+            self.stats_text.insert('end', f"{count:>5}  ", 'num')
+            self.stats_text.insert('end', f"{format_size(size):>10}\n", 'num')
+        self.stats_text.config(state='disabled')
 
     def _fill_uncounted(self, symlinks, errors):
         """只列真正没算进总数里的东西 —— 现在除了符号链接和读不到的，一个不落。"""
@@ -876,19 +1052,16 @@ class FolderSizeGUI:
         self.uncounted_text.config(state='disabled')
 
     def _adopt_final_tree(self, root):
-        node_count = 0
-        max_depth = 0
-        self.item_to_node.clear()
+        """把最终结果接到列表上：只走"列表上真的有那一行"的支路。
+
+        折叠着的支路在列表上根本没有行，整支跳过 —— 所以收尾不会卡。
+        """
         total = root.size or 1
         path_to_item = self.path_to_item
         item_to_node = self.item_to_node
         tree = self.tree
 
-        def adopt(node, rel_path, depth):
-            nonlocal node_count, max_depth
-            node_count += 1
-            if depth > max_depth:
-                max_depth = depth
+        def adopt(node, rel_path):
             item_id = path_to_item.get(rel_path)
             if not item_id:
                 return
@@ -899,51 +1072,19 @@ class FolderSizeGUI:
             for child in node.children:
                 child_path = rel_path + (child.name,)
                 child_id = path_to_item.get(child_path)
-                if child_id:
-                    desired.append(child_id)
-                adopt(child, child_path, depth + 1)
-            # 顺序本来就对就不动 —— 否则要为每个节点白调一次 Tcl，收尾时卡一下
+                if child_id is None:
+                    continue      # 这一行没摆在列表上，它下面更不可能有，整支跳过
+                desired.append(child_id)
+                adopt(child, child_path)
+            # 顺序本来就对就不动 —— 否则要为每个节点白调一次 Tcl
             if desired and tuple(desired) != tree.get_children(item_id):
                 for index, child_id in enumerate(desired):
                     tree.move(child_id, item_id, index)
 
-        adopt(root, (), 0)
-        self.total_label.config(text=format_size(root.size))
-        self.count_label.config(text=f"{node_count:,}")
-        self.depth_label.config(text=str(max_depth))
-        self.update_file_stats(root)
-
-    def build_tree(self, root):
-        self.tree.delete(*self.tree.get_children())
-        self.item_to_node.clear()
-        self.path_to_item.clear()
-        self.item_to_path.clear()
-        self.total_bytes = root.size
-        node_count = 0
-        max_depth = 0
-        total = root.size or 1
-
-        def insert_node(parent_id, node, rel_path, depth):
-            nonlocal node_count, max_depth
-            node_count += 1
-            max_depth = max(max_depth, depth)
-            item_id = self.tree.insert(
-                parent_id, 'end', text=node.name,
-                values=self._node_values(node, total), tags=self._node_tags(node),
-                open=depth < 3,
-            )
-            self.item_to_node[item_id] = node
-            self.path_to_item[rel_path] = item_id
-            self.item_to_path[item_id] = rel_path
-            for child in node.children:
-                insert_node(item_id, child, rel_path + (child.name,), depth + 1)
-            return item_id
-
-        insert_node('', root, (), 0)
-        self.live_max_depth = max_depth
-        self.total_label.config(text=format_size(root.size))
-        self.count_label.config(text=f"{node_count:,}")
-        self.depth_label.config(text=str(max_depth))
+        adopt(root, ())
+        # 最终结果已经在内存里了，暂存的那份可以扔了，省内存
+        self._deferred = {}
+        self._node_override = {}
 
     def _clear_stats(self):
         self.stats_text.config(state='normal')
@@ -955,36 +1096,6 @@ class FolderSizeGUI:
         self.uncounted_text.delete(1.0, 'end')
         self.uncounted_text.insert('end', "扫描完成后在这里显示\n", 'dim')
         self.uncounted_text.config(state='disabled')
-
-    def update_file_stats(self, root):
-        stats = {}
-        def collect_stats(node):
-            if not node.is_dir:
-                ext = node.name.rsplit('.', 1)[-1].lower() if '.' in node.name else 'no_ext'
-                if ext not in stats:
-                    stats[ext] = {'count': 0, 'size': 0}
-                stats[ext]['count'] += 1
-                stats[ext]['size'] += node.size
-            else:
-                for child in node.children:
-                    collect_stats(child)
-        collect_stats(root)
-        sorted_stats = sorted(stats.items(), key=lambda x: x[1]['size'], reverse=True)[:20]
-        max_size = sorted_stats[0][1]['size'] if sorted_stats else 1
-
-        self.stats_text.config(state='normal')
-        self.stats_text.delete(1.0, 'end')
-        for ext, data in sorted_stats:
-            bar_len = max(1, int(data['size'] / max_size * 12))
-            label = '.' + ext
-            if len(label) > 9:
-                label = label[:8] + '…'
-            self.stats_text.insert('end', f"{label:<9}", 'name')
-            self.stats_text.insert('end', "█" * bar_len, 'bar')
-            self.stats_text.insert('end', " " * (13 - bar_len), 'bar')
-            self.stats_text.insert('end', f"{data['count']:>5}  ", 'num')
-            self.stats_text.insert('end', f"{format_size(data['size']):>10}\n", 'num')
-        self.stats_text.config(state='disabled')
 
     # ---------- 交互 ----------
 
@@ -1033,16 +1144,30 @@ class FolderSizeGUI:
             self.sort_children_of_node(node, lambda x: x.name.lower(), True)
 
     def expand_all(self):
-        def expand(item):
-            self.tree.item(item, open=True)
-            for child in self.tree.get_children(item):
-                expand(child)
-        for item in self.tree.get_children(''):
-            expand(item)
+        if not self.current_root:
+            return
+        # 把所有文件夹都标记成"展开"，交给懒加载去摆行 —— 分片摆，不会一下卡住
+        all_dirs = set()
+        stack = [((), self.current_root)]
+        while stack:
+            path, node = stack.pop()
+            for child in node.children:
+                child_path = path + (child.name,)
+                if child.is_dir:
+                    all_dirs.add(child_path)
+                    stack.append((child_path, child))
+        self.scan_label.config(text="正在展开全部...")
+        self._after_queue_label = "已展开全部"
+        self._rebuild_lazy(all_dirs)
 
     def collapse_all(self):
-        for item in self.tree.get_children(''):
+        self._open_paths = {()}
+        def close(item):
             self.tree.item(item, open=False)
+            for child in self.tree.get_children(item):
+                close(child)
+        for item in self.tree.get_children(''):
+            close(item)
 
     def copy_name(self):
         node = self.get_selected_node()
@@ -1066,6 +1191,7 @@ class FolderSizeGUI:
         self.search_entry.select_range(0, 'end')
 
     def apply_search(self):
+        """搜索 = 只把命中的行（加上它们的上级文件夹）摆出来，不再把整棵树推倒重来。"""
         if not self.current_root:
             return
         query = self.search_entry.get().strip().lower()
@@ -1073,30 +1199,51 @@ class FolderSizeGUI:
             self.clear_search()
             return
 
-        # Rebuild once so repeated searches also restore previously detached rows.
-        self.build_tree(self.current_root)
+        # 一次走完内存里的结果，收集"该显示的行"，顺带把命中的上级也标上
+        rows = []
+        keep = set()
+        stack = [(self.current_root, ())]
+        while stack:
+            node, rel_path = stack.pop()
+            if query in node.name.lower():
+                current = rel_path
+                while True:
+                    if current in keep:
+                        break
+                    keep.add(current)
+                    if not current:
+                        break
+                    current = current[:-1]
+            if node.is_dir:
+                for child in node.children:
+                    stack.append((child, rel_path + (child.name,)))
 
-        def filter_node(node, rel_path):
-            matched = query in node.name.lower()
-            for child in node.children:
-                child_path = rel_path + (child.name,)
-                child_matches = filter_node(child, child_path)
-                child_id = self.path_to_item.get(child_path)
-                if child_id and not child_matches:
-                    self.tree.detach(child_id)
-                matched = matched or child_matches
-            item_id = self.path_to_item.get(rel_path)
-            if matched and item_id:
-                self.tree.item(item_id, open=True)
-            return matched
+        # 命中的上级 + 命中本身，从浅到深；懒加载只摆这些
+        stack = [(self.current_root, ())]
+        while stack:
+            node, rel_path = stack.pop()
+            if rel_path and rel_path in keep:
+                rows.append((len(rel_path), rel_path, rel_path[:-1], node))
+            if node.is_dir and rel_path in keep:
+                for child in node.children:
+                    stack.append((child, rel_path + (child.name,)))
+        rows.sort(key=lambda row: row[0])
 
-        filter_node(self.current_root, ())
+        if self._pre_search_open is None:
+            self._pre_search_open = set(self._open_paths)
+        self.scan_label.config(text=f"正在显示搜索结果...")
+        self._after_queue_label = f"搜索 “{query}” · 找到 {len(keep) - 1:,} 项"
+        self._rebuild_lazy_from(rows, keep)
 
     def clear_search(self):
         if not self.current_root:
             return
-        # Rebuild tree to show all items
-        self.build_tree(self.current_root)
+        self.search_entry.delete(0, 'end')
+        restore = self._pre_search_open if self._pre_search_open is not None else {()}
+        self._pre_search_open = None
+        self.scan_label.config(text="正在恢复列表...")
+        self._after_queue_label = "已清除搜索"
+        self._rebuild_lazy(restore)
 
     def run(self):
         self.root.mainloop()
