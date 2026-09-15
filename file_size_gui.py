@@ -931,12 +931,28 @@ class StructureWindow:
         header = self._header_px(width, height, level)
         can_go_deeper = (node.is_dir and node.children
                          and level < self.levels() and height > header * 2)
-        if not can_go_deeper:
+        inner = []
+        if can_go_deeper:
+            inner = squarify(self._children_to_draw(node), x, y + header,
+                             max(0.0, width), max(0.0, height - header))
+            for child, bx, by, bw, bh in inner:
+                self._draw_treemap_block(child, bx, by, bw, bh, level + 1, family)
+        if node.is_dir and node.children and not inner:
+            self._draw_void_hint(node, x, y, width, height)
+
+    def _draw_void_hint(self, node, x, y, width, height):
+        """里面的东西没画出来的块（层数到头了 / 都太小被筛了），角上标一句。
+
+        不标的话就是一大块空白，看着跟坏了似的；点一下钻进去就能看到里面。
+        """
+        if width < self.px(90) or height < self.px(40):
             return
-        inner = squarify(self._children_to_draw(node), x, y + header,
-                         max(0.0, width), max(0.0, height - header))
-        for child, bx, by, bw, bh in inner:
-            self._draw_treemap_block(child, bx, by, bw, bh, level + 1, family)
+        text = f"里面还有 {len(node.children)} 项 · 点一下进去看"
+        font = self._font(8)
+        if font.measure(text) > width - self.px(14):
+            text = f"还有 {len(node.children)} 项…"
+        self.canvas.create_text(x + self.px(7), y + height - self.px(6),
+            anchor='sw', text=text, font=font, fill=Palette.text_muted)
 
     def _edge_color(self, node, fill):
         """文件夹描一圈比自己深一点的边：盒子套盒子，谁装着谁一眼看出。
