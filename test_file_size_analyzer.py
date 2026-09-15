@@ -126,6 +126,8 @@ class PlaceholderRowTests(unittest.TestCase):
         (root / 'sub' / 'deep').mkdir()
         (root / 'sub' / 'deep' / 'b.txt').write_bytes(b'b' * 20)
         (root / 'empty').mkdir()
+        (root / 'other').mkdir()
+        (root / 'other' / 'e.txt').write_bytes(b'e' * 7)
         (root / 'top.txt').write_bytes(b'c' * 5)
         self.gui.start_analysis(str(root))
         self.pump()
@@ -164,6 +166,41 @@ class PlaceholderRowTests(unittest.TestCase):
         self.assertIn(('sub', 'a.txt'), children)
         self.assertIn(('sub', 'deep'), children)
         self.assertNotIn(('sub',), self.gui._placeholder_of)
+
+    def test_open_loads_even_when_the_bookkeeping_is_wrong(self):
+        """账记错了、焦点又停在占位行上，照样得把里面摆出来。
+
+        这是"点开了却只显示占位行"的病根：收起来时认错行，账上一直挂着"已经展开过"。
+        """
+        item = self.gui.path_to_item[('sub',)]
+        placeholder = self.gui._placeholder_of[('sub',)]
+        self.gui._open_paths.add(('sub',))        # 假账：账上以为它早就展开过了
+        self.gui.tree.focus(placeholder)          # 焦点被它底下那条占位行占着
+        self.gui._last_click_item = ''            # 点箭头那一下没被记上
+        self.gui.tree.item(item, open=True)
+        self.gui.on_tree_open(None)
+        self.pump()
+
+        children = [self.gui.item_to_path.get(row)
+                    for row in self.gui.tree.get_children(item)]
+        self.assertIn(('sub', 'a.txt'), children)
+        self.assertIn(('sub', 'deep'), children)
+
+    def test_closing_another_folder_does_not_scratch_out_an_open_one(self):
+        """收 A 的时候焦点停在开着的 B 上，不能把 B 从账上抹掉（抹掉 B 以后点开就没反应了）。"""
+        sub_item = self.gui.path_to_item[('sub',)]
+        other_item = self.gui.path_to_item[('other',)]
+        self.gui._last_click_item = ''
+        self.gui.tree.item(sub_item, open=True)
+        self.gui.on_tree_open(None)
+        self.pump()
+        self.assertIn(('sub',), self.gui._open_paths)
+
+        self.gui.tree.focus(sub_item)          # 焦点还停在开着的 sub 上
+        self.gui.tree.item(other_item, open=False)
+        self.gui.on_tree_close(None)
+
+        self.assertIn(('sub',), self.gui._open_paths)
 
     def test_expand_all_and_search_leave_no_placeholder_behind(self):
         self.gui.expand_all()

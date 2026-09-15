@@ -953,37 +953,56 @@ class FolderSizeGUI:
         path = self._just_opened_path()
         if path is None:
             return
-        self._open_paths.add(path)
+        self._open_paths.add(path)      # 后头新摆上来的行才知道该往它里面放
         if self._load_children(path):
             self._finished = False
             self._schedule_event_poll(idle=True)
         else:
-            # 里面确实没东西：把占位行撤掉，箭头也就跟着消失
-            node = self.item_to_node.get(self.path_to_item.get(path))
-            if node is None or not node.children:
-                self._drop_placeholder(path)
+            self._drop_placeholder_if_empty(path)
 
     def _just_opened_path(self):
         """刚被展开的是哪个文件夹。
 
-        点箭头的时候，键盘焦点可能停在别的行上（比如它底下那条占位行），
-        所以不能只看 focus()：先认"刚点过的那行"，再认"列表里已经打开、但还没登记过的行"，
-        最后才认 focus()。三条都认不出来就当没这回事。
+        别拿"程序账上记着谁开着"（_open_paths）当准 —— 收起来的时候认错行，账就会记错，
+        照账办事就会出现"点开了却一直只显示占位行"的怪事。
+        列表上的真实样子才作数：一个行开着、里面却只剩那条垫底占位行 ——
+        它就是刚被点开、真内容还没摆上来的那个。
         """
         for item_id in (self._last_click_item, self.tree.focus()):
-            if self._is_open_row(item_id):
-                path = self.item_to_path.get(item_id)
-                if path is not None and path not in self._open_paths:
-                    return path
-        for item_id, path in self.item_to_path.items():
-            if path not in self._open_paths and self._is_open_row(item_id):
+            if self._is_open_row(item_id) and self._is_content_pending(item_id):
+                return self.item_to_path[item_id]
+        for path, placeholder in self._placeholder_of.items():
+            item_id = self.path_to_item.get(path)
+            if item_id is not None and self._is_open_row(item_id) and (
+                    tuple(self.tree.get_children(item_id)) == (placeholder,)):
                 return path
+        # 都认不出来就凑合一下：开着的那行本来就没什么要加载的，点一下也不会出错
+        for item_id in (self._last_click_item, self.tree.focus()):
+            if self._is_open_row(item_id):
+                return self.item_to_path[item_id]
         return None
 
     def _is_open_row(self, item_id) -> bool:
         if not item_id or item_id not in self.item_to_path:
             return False
         return bool(self.tree.item(item_id, 'open'))
+
+    def _is_content_pending(self, item_id) -> bool:
+        """这个行开着，但里面只有那条垫底占位行 = 真内容还没摆上来。"""
+        path = self.item_to_path.get(item_id)
+        placeholder = self._placeholder_of.get(path)
+        return placeholder is not None and tuple(self.tree.get_children(item_id)) == (placeholder,)
+
+    def _drop_placeholder_if_empty(self, path):
+        """里面确实没东西，才把占位行撤掉（箭头跟着消失）。
+
+        扫描还没走到它头上时先别撤 —— 撤早了箭头也没了，用户就再也点不开这个文件夹。
+        """
+        if self._scanning:
+            return
+        node = self.item_to_node.get(self.path_to_item.get(path))
+        if not node or not node.children:
+            self._drop_placeholder(path)
 
     def _drop_placeholder(self, path):
         """撤掉某个文件夹底下垫着的那条占位行。"""
@@ -992,9 +1011,17 @@ class FolderSizeGUI:
             self.tree.delete(ph)
 
     def on_tree_close(self, event):
-        path = self.item_to_path.get(self.tree.focus())
-        if path is not None:
+        """收起来了：账上抹一笔，后头新扫到的东西就别再往它里面摆了。
+
+        认错行不要紧（多留一笔只是白干点活），所以只在"确实收起来了"的行上抹账，
+        绝不把还开着的文件夹从账上抹掉 —— 那才是"点开不加载"的病根。
+        """
+        for item_id in (self._last_click_item, self.tree.focus()):
+            path = self.item_to_path.get(item_id) if item_id else None
+            if path is None or self._is_open_row(item_id):
+                continue
             self._open_paths.discard(path)
+            return
 
     def on_tree_click(self, event):
         self._last_click_item = self.tree.identify_row(event.y)
