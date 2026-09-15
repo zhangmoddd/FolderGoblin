@@ -656,7 +656,7 @@ class StructureWindow:
       · 方块图 —— 一块地方 = 一个文件夹，面积就是它的大小，谁占地方一眼就看出来；
       · 思维导图 —— 一层占一列，看的是层级结构。
     两个旋钮随时改（改完立刻重画）：画到第几层、小于百分之几的不画。
-    点一块钻进去看它里面，右键或按钮退回上一层，鼠标停住看完整路径。
+    双击钻进去看它里面，右键或按钮退回上一层，鼠标停住看完整路径。
     """
 
     ROW_HEIGHT = 26         # 思维导图：一行多高（跟着缩放走）
@@ -785,7 +785,7 @@ class StructureWindow:
     def _refresh_hint(self):
         """底下那行提示分模式说 —— 两个模式的手势不一样，混着写谁也看不懂。"""
         if self.mode.get() == 'treemap':
-            text = "点一块 = 钻进去看它里面 · 右键 = 退回上一层 · 鼠标停住看完整路径"
+            text = "双击一块 = 钻进去看它里面 · 右键 = 退回上一层 · 鼠标停住看完整路径"
         else:
             text = ("双击一块 = 钻进去 · 点左边小三角 = 收起／展开它下面 · "
                     "中键或右键按住拖动 = 移画布 · 滚轮 = 缩放")
@@ -1029,10 +1029,16 @@ class StructureWindow:
                     font=self._font(9), fill=Palette.text_muted)
             return
         if width >= self.px(16) and height >= self.px(58):
-            # 窄高条：横排一个字都放不下，竖过来写正好
-            self.canvas.create_text(x + width / 2.0, y + height / 2.0,
-                text=self._fit(node.name, height - self.px(12), 8),
-                font=self._font(8), fill=Palette.text, angle=90)
+            # 窄高条：字一个一个正着摞下来（竖排招牌那种）。
+            # 以前整行转 90 度躺着写，中文歪头看着别扭，摞着排才顺眼。
+            room_chars = max(1, int((height - self.px(12))
+                                    // self._font(8).metrics('linespace')))
+            text = node.name
+            if len(text) > room_chars:
+                text = text[:max(1, room_chars - 1)] + '…'
+            self.canvas.create_text(x + width / 2.0, y + self.px(6), anchor='n',
+                justify='center', text='\n'.join(text),
+                font=self._font(8), fill=Palette.text)
             return
         if width >= self.px(34) and height >= line_h + self.px(1):
             # 矮墩块：横排挤得下几个字就掐短了写几个
@@ -1309,14 +1315,16 @@ class StructureWindow:
         self._highlight_block(None)
 
     def _on_click(self, event):
-        """单击：方块图里就直接钻进去（那儿没有拖动，点一下不会误触）。"""
-        if self.mode.get() == 'treemap':
-            self._drill(self._node_at(event.x, event.y))
+        """单击：什么都不干。
+
+        以前单击就钻进去 —— 最大化窗口后随手点一下画布，就误闯进深层了；
+        双击还会被当成点了两次、连钻两层。现在钻进去只认双击。
+        """
+        pass
 
     def _on_double_click(self, event):
-        """双击：思维导图里钻进去（那儿单击要留给"选一块看看"）。"""
-        if self.mode.get() == 'mindmap':
-            self._drill(self._node_at(event.x, event.y))
+        """双击：钻进鼠标底下那块（方块图、思维导图都一样）。"""
+        self._drill(self._node_at(event.x, event.y))
 
     def _drill(self, node):
         if node is None or not node.is_dir or not node.children:
