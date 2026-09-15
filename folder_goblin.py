@@ -1432,11 +1432,14 @@ class FolderSizeGUI:
     STATS_TOP = 19               # 右侧"文件类型统计"最多列这么多种（加上表头刚好一屏）
     STATS_NAME_WIDTH = 9         # 那一栏里文件类型名占几格
 
-    def __init__(self):
+    def __init__(self, show=True):
         self.dpi_ok = enable_dpi_awareness()
         self.scale = get_scale_factor() if self.dpi_ok else 1.0
 
         self.root = tk.Tk()
+        # 测试传 show=False：创建出来立刻藏起来，别让几十个测试在任务栏挨个闪
+        if not show:
+            self.root.withdraw()
         self.root.title("FolderGoblin - 文件夹大小分析器")
         # 窗口图标：源码跑找脚本旁边的 icon.ico；打包跑找解包目录里的（打包时用 --add-data 装进去）
         for _base in (os.path.dirname(os.path.abspath(__file__)), getattr(sys, "_MEIPASS", "")):

@@ -186,11 +186,10 @@ class PlaceholderRowTests(unittest.TestCase):
 
     def setUp(self):
         try:
-            self.gui = FolderSizeGUI()
+            self.gui = FolderSizeGUI(show=False)   # 藏着开，不在任务栏闪
         except Exception as exc:            # 没有桌面会话就开不了窗口
             self.skipTest(f"开不了窗口：{exc}")
         self.addCleanup(self.gui.root.destroy)
-        self.gui.root.withdraw()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
