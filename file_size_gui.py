@@ -353,6 +353,132 @@ class AnalysisThread:
         self._pause_event.set()
 
 
+class CleanScrollbar(tk.Canvas):
+    """自己画的滚动条。
+
+    为啥不用 Tk 自带的：自带滚动条的滑块长度是按"内容比例"算的 ——
+    列表里四万行、几十万行的时候，滑块只剩不到 1 个像素，看不见也抓不住。
+    自己画就能给滑块保一个最小长度，几万行也照样看得见、抓得动。
+    内容一屏装得下时由界面把它收起来（所以正常状态下列表边上不会有灰杠）。
+    """
+
+    MIN_THUMB = 24          # 滑块最短多少像素
+    TRACK = '#DCE0E6'       # 滑槽
+    THUMB = '#A9B2BD'       # 滑块
+    THUMB_HOVER = '#808A97'  # 鼠标压上去时
+
+    def __init__(self, master, orient='vertical', command=None, thickness=12, **kw):
+        vertical = orient == 'vertical'
+        super().__init__(master,
+            width=thickness if vertical else 1,
+            height=1 if vertical else thickness,
+            highlightthickness=0, bd=0, bg=kw.pop('bg', Palette.surface), **kw)
+        self.orient = orient
+        self.command = command
+        self.thickness = thickness
+        self.first = 0.0
+        self.last = 1.0
+        self._grab_offset = None
+        self._hover = False
+        self.bind('<Configure>', lambda _event: self._redraw())
+        self.bind('<Button-1>', self._on_press)
+        self.bind('<B1-Motion>', self._on_drag)
+        self.bind('<ButtonRelease-1>', lambda _event: setattr(self, '_grab_offset', None))
+        self.bind('<Enter>', lambda _event: self._set_hover(True))
+        self.bind('<Leave>', lambda _event: self._set_hover(False))
+        self.bind('<MouseWheel>', self._on_wheel)
+
+    # ---------- Tk 那边调用的接口 ----------
+
+    def set(self, first, last):
+        """Tk 每次滚动 / 内容变化都会调这里。first、last 是"看得见的区间占多少"。"""
+        self.first, self.last = float(first), float(last)
+        self._redraw()
+
+    def is_scrollable(self) -> bool:
+        """内容装不下才需要它露脸。"""
+        return self.last - self.first < 1.0
+
+    # ---------- 画 ----------
+
+    def _length(self) -> int:
+        return self.winfo_height() if self.orient == 'vertical' else self.winfo_width()
+
+    def _thumb_span(self):
+        """算出滑块该从哪儿画到哪儿（像素）。
+
+        关键在最后那步换算：滑块被顶到最小长度后，它"能走的路"就短了，
+        位置也必须按"能走的路"来摊，不然一抓就跳。
+        """
+        length = self._length()
+        fraction = min(1.0, max(0.0, self.last - self.first))
+        thumb = min(length, max(self.MIN_THUMB, fraction * length))
+        travel = max(0.0, length - thumb)
+        if fraction >= 1.0 or travel <= 0:
+            start = 0.0
+        else:
+            start = min(travel, max(0.0, self.first / (1.0 - fraction) * travel))
+        return start, thumb
+
+    def _redraw(self):
+        self.delete('all')
+        length = self._length()
+        thickness = self.thickness
+        if length <= 2 or thickness <= 2:
+            return
+        vertical = self.orient == 'vertical'
+        if vertical:
+            self.create_rectangle(3, 0, thickness - 3, length, fill=self.TRACK, outline='')
+        else:
+            self.create_rectangle(0, 3, length, thickness - 3, fill=self.TRACK, outline='')
+        start, thumb = self._thumb_span()
+        if thumb >= length - 1:
+            return                      # 一屏装得下，整条就是滑块，没必要再画
+        color = self.THUMB_HOVER if self._hover else self.THUMB
+        radius = (thickness - 4) / 2.0
+        centre = thickness / 2.0
+        if vertical:
+            self.create_line(centre, start + radius, centre, start + thumb - radius,
+                width=thickness - 4, capstyle='round', fill=color)
+        else:
+            self.create_line(start + radius, centre, start + thumb - radius, centre,
+                width=thickness - 4, capstyle='round', fill=color)
+
+    def _set_hover(self, hover: bool):
+        self._hover = hover
+        self._redraw()
+
+    # ---------- 抓滑块 / 点滑槽 ----------
+
+    def _pos(self, event) -> int:
+        return event.y if self.orient == 'vertical' else event.x
+
+    def _on_press(self, event):
+        position = self._pos(event)
+        start, thumb = self._thumb_span()
+        if start <= position <= start + thumb:
+            self._grab_offset = position - start      # 抓住滑块本身，别让它跳
+        else:
+            self._grab_offset = None
+            if self.command is not None:              # 点滑槽 = 翻一页，跟系统滚动条一个脾气
+                self.command('scroll', 1 if position > start else -1, 'pages')
+
+    def _on_drag(self, event):
+        if self._grab_offset is None or self.command is None:
+            return
+        length = self._length()
+        start, thumb = self._thumb_span()
+        travel = max(1.0, length - thumb)
+        fraction = min(1.0, max(0.0, self.last - self.first))
+        wanted = min(travel, max(0.0, self._pos(event) - self._grab_offset))
+        self.command('moveto', wanted / travel * (1.0 - fraction))
+
+    def _on_wheel(self, event):
+        """鼠标压在滚动条上滚轮也得管用（不然那一条就成了死区）。"""
+        if self.command is not None:
+            self.command('scroll', -1 if event.delta > 0 else 1, 'units')
+
+
 class FolderSizeGUI:
     SLICE_SECONDS = 0.008        # 每次轮询最多占用主线程 8 毫秒，超了就下一轮接着干
     MAX_LABEL_REFRESH = 200      # 每轮最多刷新 200 个节点的文字，防止父节点太多把主线程拖住
@@ -449,22 +575,6 @@ class FolderSizeGUI:
             background=[('active', Palette.surface_alt)],
             relief=[('active', 'flat')],
         )
-
-        for orient in ('Vertical', 'Horizontal'):
-            name = f'Clean.{orient}.TScrollbar'
-            style.configure(name,
-                background='#C1C7CE',
-                # 滑槽给点浅灰：列表里有三十万行时滑块只剩 1 像素，滑槽太白就等于隐形
-                troughcolor='#F0F1F3',
-                bordercolor='#F0F1F3',
-                darkcolor='#F0F1F3',
-                lightcolor='#F0F1F3',
-                arrowcolor='#F0F1F3',
-                borderwidth=0,
-                arrowsize=self.px(10),
-                width=self.px(10),
-            )
-            style.map(name, background=[('active', '#98A0AA')])
 
         style.configure('Clean.Horizontal.TProgressbar',
             background=Palette.accent,
@@ -673,9 +783,9 @@ class FolderSizeGUI:
             highlightthickness=1, highlightbackground=Palette.border)
         tree_card.pack(side='left', fill='both', expand=True)
 
-        # 两条滚动条平时藏着 —— 一屏装得下就没必要杵着一条灰杠（装不下才自己冒出来）
-        self.scroll_y = ttk.Scrollbar(tree_card, orient='vertical', style='Clean.Vertical.TScrollbar')
-        self.scroll_x = ttk.Scrollbar(tree_card, orient='horizontal', style='Clean.Horizontal.TScrollbar')
+        # 两条滚动条是"自己画的"，平时藏着 —— 一屏装得下就没必要杵着一条灰杠
+        self.scroll_y = CleanScrollbar(tree_card, orient='vertical')
+        self.scroll_x = CleanScrollbar(tree_card, orient='horizontal')
 
         self.tree = ttk.Treeview(tree_card,
             style='Clean.Treeview',
@@ -685,8 +795,8 @@ class FolderSizeGUI:
             xscrollcommand=self._on_tree_xscroll)
         self.tree.pack(side='left', fill='both', expand=True,
             padx=self.px(2), pady=self.px(2))
-        self.scroll_y.config(command=self.tree.yview)
-        self.scroll_x.config(command=self.tree.xview)
+        self.scroll_y.command = self.tree.yview
+        self.scroll_x.command = self.tree.xview
 
         self.tree.heading('#0', text="名称", anchor='w')
         self.tree.heading('size', text="大小", anchor='e')
@@ -710,14 +820,14 @@ class FolderSizeGUI:
     def _on_tree_yscroll(self, first, last):
         """Tk 每滚一下、内容一变就会调这里。顺手判断竖直滚动条该不该露脸。"""
         self.scroll_y.set(first, last)
-        self._toggle_scrollbar(self.scroll_y, float(last) - float(first) < 1.0,
+        self._toggle_scrollbar(self.scroll_y, self.scroll_y.is_scrollable(),
                                side='right', fill='y',
                                padx=(0, self.px(2)), pady=self.px(2))
 
     def _on_tree_xscroll(self, first, last):
         """横向同理。列表一般装得下，所以这条平时根本不出现。"""
         self.scroll_x.set(first, last)
-        self._toggle_scrollbar(self.scroll_x, float(last) - float(first) < 1.0,
+        self._toggle_scrollbar(self.scroll_x, self.scroll_x.is_scrollable(),
                                side='bottom', fill='x',
                                padx=self.px(2), pady=(0, self.px(2)))
 
