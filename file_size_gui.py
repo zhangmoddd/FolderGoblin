@@ -922,12 +922,13 @@ class StructureWindow:
         width, height = width - gap * 2, height - gap * 2
         if width < self.MIN_BLOCK_PX or height < self.MIN_BLOCK_PX:
             return
+        fill = self._fill_color(node, level, family)
         rect = self.canvas.create_rectangle(x, y, x + width, y + height,
-            fill=self._fill_color(node, level, family), outline='', width=0)
+            fill=fill, outline=self._edge_color(node, fill), width=self.px(1))
         self._block_nodes[rect] = node
         self._block_rects[id(node)] = (x, y, width, height)
-        self._draw_treemap_label(node, x, y, width, height)
-        header = self._header_px(width, height)
+        self._draw_treemap_label(node, x, y, width, height, level)
+        header = self._header_px(width, height, level)
         can_go_deeper = (node.is_dir and node.children
                          and level < self.levels() and height > header * 2)
         if not can_go_deeper:
@@ -937,39 +938,60 @@ class StructureWindow:
         for child, bx, by, bw, bh in inner:
             self._draw_treemap_block(child, bx, by, bw, bh, level + 1, family)
 
+    def _edge_color(self, node, fill):
+        """文件夹描一圈比自己深一点的边：盒子套盒子，谁装着谁一眼看出。
+
+        文件不描 —— 光板没边的那块就是文件，跟文件夹当场分开。
+        """
+        if not node.is_dir:
+            return ''
+        r, g, b = int(fill[1:3], 16), int(fill[3:5], 16), int(fill[5:7], 16)
+        return '#%02X%02X%02X' % (int(r * 0.72), int(g * 0.72), int(b * 0.72))
+
     def _label_roomy(self, width, height):
-        """这块地方算不算宽敞：宽敞就写两行（名字 + 多大），窄就只写名字。"""
+        """这块地方算不算宽敞：宽敞就多写点，窄就只写名字。"""
         return width >= self.px(150) and height >= self.px(46)
 
-    def _header_px(self, width, height):
+    def _header_px(self, width, height, level):
         """方块顶上得给字留多高的地方。
 
         以前写死 15 像素，可宽敞块要写两行字，两行得 40 多像素 ——
         多出来的字全压到下面的子方块上，名字糊成一团。
         字有多高直接问字体本人要，不写死，缩放、换电脑都不会错。
+        头衔也跟着层级走：越往里头的块，顶上留的地方越小。
         """
         top = self.px(5)
-        if self._label_roomy(width, height):
+        roomy = self._label_roomy(width, height)
+        if level <= 1 and roomy:
             two_lines = (self._font(11, bold=True).metrics('linespace')
                          + self._font(9).metrics('linespace'))
             return top + two_lines + self.px(4)
+        if level == 2 and roomy:
+            return top + self._font(9, bold=True).metrics('linespace') + self.px(2)
         return top + self._font(8).metrics('linespace') + self.px(2)
 
-    def _draw_treemap_label(self, node, x, y, width, height):
+    def _draw_treemap_label(self, node, x, y, width, height, level):
         """方块上写名儿。
 
+        头衔跟着层级走：最上层大字标题加"多大"，第二层中号粗体，
+        再往下小字 —— 字越大越靠外，谁包着谁看字就知道。
         地方小就不写 —— 硬写上去就是一堆 "steamap"、"Workbu"，比不写还乱。
-        地方大的（第一层那种大块）写大号字，再加一行"多大、占这里多少"。
         """
         roomy = self._label_roomy(width, height)
-        size = 11 if roomy else 8
-        line1_bottom = self.px(5) + self._font(size, bold=roomy).metrics('linespace')
+        if level <= 1 and roomy:
+            size, bold, with_info = 11, True, True
+        elif level == 2 and roomy:
+            size, bold, with_info = 9, True, False
+        else:
+            size, bold, with_info = 8, False, False
+        font = self._font(size, bold=bold)
+        line1_bottom = self.px(5) + font.metrics('linespace')
         if width < self.px(58) or height < line1_bottom + self.px(1):
             return
         self.canvas.create_text(x + self.px(7), y + self.px(5), anchor='nw',
-            text=self._fit(node.name, width - self.px(14), size, bold=roomy),
-            font=self._font(size, bold=roomy), fill=Palette.text)
-        if roomy:
+            text=self._fit(node.name, width - self.px(14), size, bold=bold),
+            font=font, fill=Palette.text)
+        if with_info:
             share = node.size / max(1, self.current().size) * 100.0
             self.canvas.create_text(x + self.px(7), y + line1_bottom + self.px(2),
                 anchor='nw',
