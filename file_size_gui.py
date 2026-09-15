@@ -687,6 +687,8 @@ class StructureWindow:
         self.min_share = tk.DoubleVar(value=0.3)
         self.zoom = 1.0                          # 思维导图的缩放（滚轮改）
         self.collapsed = set()                   # 思维导图里被收起来的节点（存 id）
+        self._zoom_job = None                    # 缩放攒批的定时器
+        self._pending_anchor = None              # 缩放完要把哪块按回光标底下
         self._block_nodes = {}                   # 画布图元 -> 节点
         self._block_rects = {}                   # 节点 id -> 它那块的位置（高亮用）
         self._highlight = None                   # 鼠标压住的那块的高亮框
@@ -758,7 +760,7 @@ class StructureWindow:
 
         self.canvas = tk.Canvas(card, bg=Palette.surface, highlightthickness=0, bd=0)
         self.canvas.pack(fill='both', expand=True)
-        self.canvas.bind('<Configure>', lambda _event: self._render_soon())
+        self.canvas.bind('<Configure>', lambda _event: self._render_soon(center=False))
         self.canvas.bind('<Motion>', self._on_motion)
         self.canvas.bind('<Leave>', self._on_leave)
         self.canvas.bind('<Button-1>', self._on_click)
@@ -836,17 +838,25 @@ class StructureWindow:
 
     # ---------- 画 ----------
 
-    def _render_soon(self):
+    def _render_soon(self, center=True):
         if self._render_job is None:
-            self._render_job = self.win.after(60, self._render)
+            self._render_job = self.win.after(60, lambda: self._render(center=center))
 
-    def _render(self):
+    def _render(self, center=True):
+        """重画整张图。
+
+        center=True 时画完把根节点摆到画面正中（开图、钻进去、改旋钮就用这个）；
+        缩放、收放节点这些"手在图上动"的操作要传 False —— 它们自己会把手底下的东西对回原位，
+        两边都挪就会看到画面来回跳。
+        """
         self._render_job = None
         if not self.win.winfo_exists():
             return
         self.tip.cancel()
         self._hover_node = None
         self._highlight = None
+        self._zoom_job = None
+        self._pending_anchor = None
         self.canvas.delete('all')
         self._block_nodes.clear()
         self._block_rects.clear()
@@ -857,8 +867,9 @@ class StructureWindow:
             self._render_treemap(node)
         else:
             self._render_mindmap(node)
-            # 导图是把根节点摆在整张图正中，图一高就跑到屏幕外了 —— 手动把它挪到画面中间
-            self._center_on(node)
+            if center:
+                # 导图把根节点摆在整张图正中，图一高根就跑到屏幕外了 —— 手动挪到画面中间
+                self._center_on(node)
 
     def _center_on(self, node):
         """把某个方块挪到画面正中：开图、钻进去的时候，先让人看见自己在哪。"""
@@ -989,16 +1000,30 @@ class StructureWindow:
                 self.canvas.create_text(x + self.px(7), y, anchor='w',
                     text=self._fit(label, box_w - self.px(14), text_size),
                     font=self._font(text_size), fill=Palette.text)
-        self.canvas.configure(scrollregion=self.canvas.bbox('all') or (0, 0, width, height))
+        # 画布的可活动范围往外多放一圈：拖起来有"画布很大"的感觉，不会被内容框死
+        region = self.canvas.bbox('all') or (0, 0, width, height)
+        pad = self.px(500)
+        x0, y0, x1, y1 = region
+        self.canvas.configure(scrollregion=(x0 - pad, y0 - pad, x1 + pad, y1 + pad))
 
     def toggle_collapse(self, node):
-        """收起／展开一个节点的子元素（导图里点它左边那个小三角）。"""
+        """收起／展开一个节点的子元素（导图里点它左边那个小三角）。
+
+        收放完把这一块按回原来的屏幕位置 —— 不然底下一折，画面整体往上一跳，看着像闪了一下。
+        """
+        rect = self._block_rects.get(id(node))
+        screen = None
+        if rect is not None:
+            screen = (rect[0] - self.canvas.canvasx(0), rect[1] - self.canvas.canvasy(0))
         key = id(node)
         if key in self.collapsed:
             self.collapsed.discard(key)
         else:
             self.collapsed.add(key)
-        self._render()
+        self._render(center=False)
+        rect = self._block_rects.get(id(node))
+        if screen is not None and rect is not None:
+            self._scroll_to(rect[0] - screen[0], rect[1] - screen[1])
 
     # ---------- 缩放 / 拖画布 ----------
 
@@ -1018,7 +1043,8 @@ class StructureWindow:
     def _on_wheel(self, event):
         """滚轮缩放。
 
-        缩的时候，光标底下那个点得待在原地 —— 不然一缩就找不着刚才盯着的地方了。
+        缩放时盯着光标底下那一块：缩完把这块按回光标底下，画面就不会乱跑。
+        连着滚的时候攒一攒、统一重画一次 —— 一格一格立刻重画太卡。
         """
         if self.mode.get() != 'mindmap':
             return                        # 方块图本来就铺满一屏，没什么可缩的
@@ -1026,13 +1052,60 @@ class StructureWindow:
         new_zoom = min(self.MAX_ZOOM, max(self.MIN_ZOOM, self.zoom * factor))
         if abs(new_zoom - self.zoom) < 1e-6:
             return
-        anchor_x = self.canvas.canvasx(event.x)
-        anchor_y = self.canvas.canvasy(event.y)
-        ratio = new_zoom / self.zoom
+        self._pending_anchor = self._capture_anchor(event)
         self.zoom = new_zoom
-        self._render()
-        self.canvas.update_idletasks()
-        self._scroll_to(anchor_x * ratio - event.x, anchor_y * ratio - event.y)
+        if self._zoom_job is None:
+            self._zoom_job = self.win.after(30, self._apply_zoom)
+
+    def _capture_anchor(self, event):
+        """记住光标底下（或附近）是哪一块、压在这块里的什么位置 —— 缩放完按这个对回去。
+
+        光标正好压在块上最好；落在空白里就就近抓一块当"锚"，不然缩放完画面不知道往哪儿对。
+        """
+        node = self._node_at(event.x, event.y)
+        rect = self._block_rects.get(id(node)) if node is not None else None
+        if rect is None:
+            node, rect = self._nearest_block(event.x, event.y)
+        if rect is None or node is None:
+            return None
+        content_x = self.canvas.canvasx(event.x)
+        content_y = self.canvas.canvasy(event.y)
+        return (node,
+                (content_x - rect[0]) / max(1.0, rect[2]),
+                (content_y - rect[1]) / max(1.0, rect[3]),
+                event.x, event.y)
+
+    def _nearest_block(self, x, y):
+        """离某个点最近的一块（带它的地盘）。找不到就返回 (None, None)。"""
+        cx, cy = self.canvas.canvasx(x), self.canvas.canvasy(y)
+        best_node = None
+        best_rect = None
+        best_dist = None
+        for item_id, node in self._block_nodes.items():
+            rect = self._block_rects.get(id(node))
+            if rect is None:
+                continue
+            bx, by, bw, bh = rect
+            dx = max(bx - cx, 0.0, cx - (bx + bw))
+            dy = max(by - cy, 0.0, cy - (by + bh))
+            dist = dx * dx + dy * dy
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_node = node
+                best_rect = rect
+        return best_node, best_rect
+
+    def _apply_zoom(self):
+        self._zoom_job = None
+        anchor = self._pending_anchor
+        self._pending_anchor = None
+        self._render(center=False)
+        if anchor is not None:
+            node, rel_x, rel_y, win_x, win_y = anchor
+            rect = self._block_rects.get(id(node))
+            if rect is not None:
+                self._scroll_to(rect[0] + rel_x * rect[2] - win_x,
+                                rect[1] + rel_y * rect[3] - win_y)
 
     def _scroll_to(self, x, y):
         """把画布挪到某个位置（用比例挪，画布就这么干的）。"""
@@ -1079,8 +1152,13 @@ class StructureWindow:
     # ---------- 鼠标 ----------
 
     def _node_at(self, x, y):
-        """鼠标底下是哪一块（后画的压在上面，所以倒着找）。"""
-        for item_id in reversed(self.canvas.find_overlapping(x, y, x, y)):
+        """鼠标底下是哪一块（后画的压在上面，所以倒着找）。
+
+        注意：传进来的是"窗口坐标"，得先换算成"画布坐标"再找 ——
+        画布一拖动、一缩放，两边就对不上了，不换算就会指错块。
+        """
+        cx, cy = self.canvas.canvasx(x), self.canvas.canvasy(y)
+        for item_id in reversed(self.canvas.find_overlapping(cx, cy, cx, cy)):
             node = self._block_nodes.get(item_id)
             if node is not None:
                 return node
