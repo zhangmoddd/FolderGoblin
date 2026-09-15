@@ -690,6 +690,7 @@ class FolderSizeGUI:
 
         self.tree.bind("<Button-3>", self.show_context_menu)
         self.tree.bind("<Button-1>", self.on_tree_click)
+        self.tree.bind("<ButtonRelease-1>", self.after_tree_click)
         self.tree.bind("<<TreeviewOpen>>", self.on_tree_open)
         self.tree.bind("<<TreeviewClose>>", self.on_tree_close)
 
@@ -835,6 +836,9 @@ class FolderSizeGUI:
             # 扫描线程说自己跑完了，但"完成"事件刚好在这几毫秒里才塞进队列 —— 下一轮再收尾。
             # 不然状态栏会一直挂着"正在扫描"，数字和类型统计也永远不落地。
             self._schedule_event_poll(idle=True)
+        elif self._fill_open_folders():
+            # 列表上还留着"开着却空着"的文件夹，接着摆
+            self._schedule_event_poll(idle=True)
         else:
             self._finished = True
             if self._after_queue_label:
@@ -951,14 +955,36 @@ class FolderSizeGUI:
 
     def on_tree_open(self, event):
         path = self._just_opened_path()
-        if path is None:
-            return
-        self._open_paths.add(path)      # 后头新摆上来的行才知道该往它里面放
-        if self._load_children(path):
-            self._finished = False
-            self._schedule_event_poll(idle=True)
-        else:
-            self._drop_placeholder_if_empty(path)
+        if path is not None:
+            self._open_paths.add(path)   # 后头新摆上来的行才知道该往它里面放
+            if self._load_children(path):
+                self._finished = False
+                self._schedule_event_poll(idle=True)
+            else:
+                self._drop_placeholder_if_empty(path)
+        self._fill_open_folders()
+
+    def _fill_open_folders(self) -> bool:
+        """自查一遍：列表上凡是"开着、里面却只挂着占位行"的文件夹，都把它内容摆出来。
+
+        正常点开那一下就已经摆好了，这一步纯粹是防漏 ——
+        认错行、事件没发出来、账记错了，这些情况全兜得住，反正"开着却空着"就是不对。
+        摆了新东西就返回 True（调用方据此接着排轮询）。
+        """
+        queued = False
+        for path, placeholder in list(self._placeholder_of.items()):
+            item_id = self.path_to_item.get(path)
+            if item_id is None or not self._is_open_row(item_id):
+                continue
+            if tuple(self.tree.get_children(item_id)) != (placeholder,):
+                continue
+            self._open_paths.add(path)
+            if self._load_children(path):
+                self._finished = False
+                queued = True
+            else:
+                self._drop_placeholder_if_empty(path)
+        return queued
 
     def _just_opened_path(self):
         """刚被展开的是哪个文件夹。
@@ -1025,6 +1051,16 @@ class FolderSizeGUI:
 
     def on_tree_click(self, event):
         self._last_click_item = self.tree.identify_row(event.y)
+
+    def after_tree_click(self, event):
+        """手点完之后兜个底。
+
+        万一点开的事件压根没发出来，或者认错了行，这里也能凭"列表上开着却空着"把它补上。
+        """
+        if self.current_root is None:
+            return
+        if self._fill_open_folders():
+            self._schedule_event_poll(idle=True)
 
     def _collect_visible(self, open_paths):
         """按"哪些文件夹是展开的"，算出该显示哪些行，从浅到深排好。"""

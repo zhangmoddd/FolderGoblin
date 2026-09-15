@@ -202,6 +202,19 @@ class PlaceholderRowTests(unittest.TestCase):
 
         self.assertIn(('sub',), self.gui._open_paths)
 
+    def test_click_watchdog_fills_an_open_but_empty_folder(self):
+        """最坏情况：行被点开了，但"点开"的事件压根没发出来 —— 手点一下的兜底也得把内容摆上。"""
+        item = self.gui.path_to_item[('sub',)]
+        self.gui.tree.item(item, open=True)      # 行是开着的……
+        self.gui._last_click_item = ''
+        self.gui.after_tree_click(None)          # ……但只走"点完自查"这条路，没有任何"点开"事件
+        self.pump()
+
+        children = [self.gui.item_to_path.get(row)
+                    for row in self.gui.tree.get_children(item)]
+        self.assertIn(('sub', 'a.txt'), children)
+        self.assertIn(('sub', 'deep'), children)
+
     def test_expand_all_and_search_leave_no_placeholder_behind(self):
         self.gui.expand_all()
         self.pump()
