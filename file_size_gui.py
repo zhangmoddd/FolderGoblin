@@ -11,6 +11,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from bisect import bisect_left, bisect_right
 from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Dict, List, Optional
@@ -689,6 +690,13 @@ class StructureWindow:
         self.collapsed = set()                   # 思维导图里被收起来的节点（存 id）
         self._zoom_job = None                    # 缩放攒批的定时器
         self._pending_anchor = None              # 缩放完要把哪块按回光标底下
+        self._pan_job = None                     # 拖动画布时补画的定时器
+        self._drawn_top = None                   # 这回画到了哪：y 上沿（画布坐标）
+        self._drawn_bottom = None                # 这回画到了哪：y 下沿（画布坐标）
+        self._mm_cys = None                      # 导图鼠标索引：按 y 排好的行中心
+        self._mm_items = None                    # 导图鼠标索引：跟 _mm_cys 一一对应
+        self._mm_places = None                   # 导图鼠标索引：节点 -> (x, y)
+        self._mm_box = None                      # 导图鼠标索引：方块宽高
         self._block_nodes = {}                   # 画布图元 -> 节点
         self._block_rects = {}                   # 节点 id -> 它那块的位置（高亮用）
         self._block_parents = {}                 # 节点 id -> 装着它的那块（画虚线用）
@@ -853,21 +861,26 @@ class StructureWindow:
         if self._render_job is None:
             self._render_job = self.win.after(60, lambda: self._render(focus=focus))
 
-    def _render(self, focus='center'):
+    def _render(self, focus='center', keep=None):
         """重画整张图。
 
         focus='center'：画完把当前根节点摆到画面正中（钻进去、退回来就用这个）；
         focus='top'：整棵树上下居中、根节点靠左站好（开图、改旋钮用这个）；
         focus=None：画面一动不动（缩放、收放节点 —— 它们自己会把手底下的东西对回原位）。
+        keep：就算落在"画出来的范围"外面也硬要画的节点 —— 缩放的锚点、刚点过的块，
+        画完要照着它们对位置，缺了就对不上。导图只画看得见的一屏，才有这个补丁。
         """
         self._render_job = None
         if not self.win.winfo_exists():
             return
+        if focus is not None and self._zoom_job is not None:
+            # 换地方看（钻进去、退回来、换模式）＝ 没落地的缩放作废
+            self.win.after_cancel(self._zoom_job)
+            self._zoom_job = None
+            self._pending_anchor = None
         self.tip.cancel()
         self._hover_node = None
         self._highlight = None
-        self._zoom_job = None
-        self._pending_anchor = None
         self.canvas.delete('all')
         self._block_nodes.clear()
         self._block_rects.clear()
@@ -878,12 +891,12 @@ class StructureWindow:
         if self.mode.get() == 'treemap':
             self._render_treemap(node)
         else:
-            self._render_mindmap(node)
+            self._render_mindmap(node, keep)
             if focus == 'center':
                 # 导图把根节点摆在整张图正中，钻进去的时候先让人看见自己在哪
                 self._center_on(node)
             elif focus == 'top':
-                # 开图 / 改旋钮：根节点摆到左上角，最大的那几支先入眼
+                # 开图 / 改旋钮：整棵树上下居中
                 self._show_centered(node)
 
     def _center_on(self, node):
@@ -912,6 +925,7 @@ class StructureWindow:
         return self.canvas.winfo_width(), self.canvas.winfo_height()
 
     def _render_treemap(self, node):
+        self._mm_cys = None                     # 方块图用不上导图的鼠标索引，清掉防串台
         width, height = self._canvas_size()
         if width < 40 or height < 40:
             self._render_soon()
@@ -1049,7 +1063,14 @@ class StructureWindow:
                 text=self._fit(node.name, width - self.px(8), 8),
                 font=self._font(8), fill=Palette.text)
 
-    def _render_mindmap(self, node):
+    def _render_mindmap(self, node, keep=None):
+        """画思维导图。
+
+        行一多（几千行）画布上"造东西"就是最贵的活 —— 全画一遍卡半天，
+        缩放拖动全是顿的。所以只画眼前这屏、前后各多留一圈：画多快只跟
+        "看得见几行"有关系，跟文件夹多大没关系。快拖到边了 _pan_repaint 会补画。
+        谁装着谁（_block_parents）还是全量记 —— 气泡报路径不能因为没画就报错。
+        """
         width, height = self._canvas_size()
         if width < 40 or height < 40:
             self._render_soon()
@@ -1074,21 +1095,41 @@ class StructureWindow:
                     counter += 1
                 else:
                     families[id(child)] = families.get(id(item), 0)
-        for item, _level, _cy in rows:                   # 连线画在方块底下
+        # 鼠标命中用的行索引：按 y 排好，来一个点二分一查，不再全画布翻
+        ordered = sorted(((cy, item) for item, _level, cy in rows), key=lambda pair: pair[0])
+        self._mm_cys = [cy for cy, _item in ordered]
+        self._mm_items = [item for _cy, item in ordered]
+        self._mm_places = places
+        self._mm_box = (box_w, box_h)
+        # 只画看得见的：窗口上下各多留一圈，拖快了也来得及补
+        margin = max(height * 1.2, self.px(800))
+        win_top = self.canvas.canvasy(0) - margin
+        win_bottom = self.canvas.canvasy(height) + margin
+        self._drawn_top = win_top
+        self._drawn_bottom = win_bottom
+        keep_ids = {id(node)}                    # 根节点永远画（居中、回顶都要找它）
+        if keep is not None:
+            keep_ids.add(id(keep))
+        for item, _level, cy in rows:                    # 连线画在方块底下
             x, y = places[id(item)]
             for child in item.children:
                 if id(child) not in places:
                     continue
-                cx, cy = places[id(child)]
+                cx, cy2 = places[id(child)]
+                lo, hi = (y, cy2) if y <= cy2 else (cy2, y)
+                if hi < win_top or lo > win_bottom:   # 这条线整段都在画面外，省了
+                    continue
                 mid = (x + box_w + cx) / 2.0
                 thick = max(1, int(min(6.0, max(1.5, zoom * 2.2),
                                        (child.size / max(1, node.size)) * 40)))
-                self.canvas.create_line(x + box_w, y, mid, y, mid, cy, cx, cy,
+                self.canvas.create_line(x + box_w, y, mid, y, mid, cy2, cx, cy2,
                     fill='#C7CDD6', width=thick, joinstyle='miter')
         text_size = max(7, int(8 * zoom))
-        for item, level, _cy in rows:
+        for item, level, cy in rows:
+            top = cy - box_h / 2.0
+            if id(item) not in keep_ids and (top > win_bottom or top + box_h < win_top):
+                continue                              # 眼睛看不见的行，不画
             x, y = places[id(item)]
-            top = y - box_h / 2.0
             rect = self.canvas.create_rectangle(x, top, x + box_w, y + box_h / 2.0,
                 fill=self._fill_color(item, level, families.get(id(item), 0)),
                 outline='', width=0)
@@ -1107,11 +1148,13 @@ class StructureWindow:
                 self.canvas.create_text(x + self.px(7), y, anchor='w',
                     text=self._fit(label, box_w - self.px(14), text_size),
                     font=self._font(text_size), fill=Palette.text)
-        # 画布的可活动范围往外多放一圈：拖起来有"画布很大"的感觉，不会被内容框死
-        region = self.canvas.bbox('all') or (0, 0, width, height)
+        # 可活动范围按"全部内容"算（不是按画了的算 —— 画是裁过的），往外多放一圈：
+        # 拖起来有"画布很大"的感觉，不会被内容框死
+        y_top = min(cy for _item, _level, cy in rows) - box_h / 2.0 - 1.0
+        y_bottom = max(cy for _item, _level, cy in rows) + box_h / 2.0 + 1.0
+        x_right = max(self.px(18) + level * col for _item, level, _cy in rows) + box_w + 1.0
         pad = self.px(500)
-        x0, y0, x1, y1 = region
-        self.canvas.configure(scrollregion=(x0 - pad, y0 - pad, x1 + pad, y1 + pad))
+        self.canvas.configure(scrollregion=(-pad, y_top - pad, x_right + pad, y_bottom + pad))
 
     def toggle_collapse(self, node):
         """收起／展开一个节点的子元素（导图里点它左边那个小三角）。
@@ -1127,7 +1170,7 @@ class StructureWindow:
             self.collapsed.discard(key)
         else:
             self.collapsed.add(key)
-        self._render(focus=None)
+        self._render(focus=None, keep=node)
         rect = self._block_rects.get(id(node))
         if screen is not None and rect is not None:
             self._scroll_to(rect[0] - screen[0], rect[1] - screen[1])
@@ -1139,6 +1182,27 @@ class StructureWindow:
 
     def _pan_move(self, event):
         self.canvas.scan_dragto(event.x, event.y, gain=1)
+        # 拖动时留意脚下：快拖到"没画过的地方"才安排补画，平时拖动零开销
+        if self.mode.get() == 'mindmap' and self._pan_job is None:
+            self._pan_job = self.win.after(90, self._pan_repaint)
+
+    def _pan_repaint(self):
+        """拖动途中的补画：只补快到边的，补完又有一圈余量可拖。"""
+        self._pan_job = None
+        if not self.win.winfo_exists() or self.mode.get() != 'mindmap':
+            return
+        if self._zoom_job is not None:        # 缩放马上要重画了，别掺和
+            return
+        if self._drawn_top is None or self._viewport_covered():
+            return                            # 眼前这一屏早就画过了，不用动
+        self._render(focus=None)
+
+    def _viewport_covered(self):
+        """眼前这屏（前后各让出大半屏）是不是都已经画过了。"""
+        height = self.canvas.winfo_height()
+        guard = height * 0.6
+        return (self.canvas.canvasy(0) - guard >= self._drawn_top
+                and self.canvas.canvasy(height) + guard <= self._drawn_bottom)
 
     def _on_right_press(self, event):
         """右键：方块图里是"退回上一层"，思维导图里是"按住拖画布"。"""
@@ -1151,7 +1215,8 @@ class StructureWindow:
         """滚轮缩放。
 
         缩放时盯着光标底下那一块：缩完把这块按回光标底下，画面就不会乱跑。
-        连着滚的时候攒一攒、统一重画一次 —— 一格一格立刻重画太卡。
+        连着滚的时候攒一攒、统一重画一次 —— 16 毫秒最多重画一回；
+        因为只画看得见的行，每回重画都很快，滚起来就是顺的。
         """
         if self.mode.get() != 'mindmap':
             return                        # 方块图本来就铺满一屏，没什么可缩的
@@ -1162,7 +1227,7 @@ class StructureWindow:
         self._pending_anchor = self._capture_anchor(event)
         self.zoom = new_zoom
         if self._zoom_job is None:
-            self._zoom_job = self.win.after(30, self._apply_zoom)
+            self._zoom_job = self.win.after(16, self._apply_zoom)
 
     def _capture_anchor(self, event):
         """记住光标底下（或附近）是哪一块、压在这块里的什么位置 —— 缩放完按这个对回去。
@@ -1206,7 +1271,7 @@ class StructureWindow:
         self._zoom_job = None
         anchor = self._pending_anchor
         self._pending_anchor = None
-        self._render(focus=None)
+        self._render(focus=None, keep=anchor[0] if anchor is not None else None)
         if anchor is not None:
             node, rel_x, rel_y, win_x, win_y = anchor
             rect = self._block_rects.get(id(node))
@@ -1259,12 +1324,26 @@ class StructureWindow:
     # ---------- 鼠标 ----------
 
     def _node_at(self, x, y):
-        """鼠标底下是哪一块（后画的压在上面，所以倒着找）。
+        """鼠标底下是哪一块。
 
+        思维导图行数多了以后，find_overlapping 要把画布上所有图元翻一遍才肯回话，
+        鼠标动一下卡一下。行索引是按 y 排好的：先二分定位到附近的几行，
+        再看 x 落不落在那一列的方块里 —— 一下就中，跟画了多少行无关。
         注意：传进来的是"窗口坐标"，得先换算成"画布坐标"再找 ——
         画布一拖动、一缩放，两边就对不上了，不换算就会指错块。
         """
         cx, cy = self.canvas.canvasx(x), self.canvas.canvasy(y)
+        if self.mode.get() == 'mindmap' and self._mm_cys:
+            box_w, box_h = self._mm_box
+            half = box_h / 2.0 + 2.0
+            lo = bisect_left(self._mm_cys, cy - half)
+            hi = bisect_right(self._mm_cys, cy + half)
+            for index in range(lo, hi):
+                item = self._mm_items[index]
+                bx, _by = self._mm_places[id(item)]
+                if bx - 2.0 <= cx <= bx + box_w + 2.0:
+                    return item
+            return None
         for item_id in reversed(self.canvas.find_overlapping(cx, cy, cx, cy)):
             node = self._block_nodes.get(item_id)
             if node is not None:
@@ -1339,9 +1418,9 @@ class StructureWindow:
 
     def close(self):
         self.tip.cancel()
-        if self._render_job is not None:
-            self.win.after_cancel(self._render_job)
-            self._render_job = None
+        for job in (self._render_job, self._zoom_job, self._pan_job):
+            if job is not None:
+                self.win.after_cancel(job)
         self.gui.structure_window = None
         self.win.destroy()
 

@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from file_size_gui import (AnalysisThread, FileNode, FolderSizeGUI, elide_middle,
                            mindmap_rows, squarify)
@@ -325,6 +326,45 @@ class PlaceholderRowTests(unittest.TestCase):
 
         view.close()
         self.assertIsNone(self.gui.structure_window)
+
+    def test_wheel_zoom_actually_moves_the_picture(self):
+        """滚一格滚轮，画面 16 毫秒内就得真的变大。
+
+        光改倍数数字、画面纹丝不动是翻过车的（滚了没反应、停手才跳一下），
+        这条测试专防这个：不调 _apply_zoom，就等定时器自己落地，量方块宽没宽。
+        """
+        self.gui.open_structure()
+        view = self.gui.structure_window
+        view.win.update()
+        view.set_mode('mindmap')
+        view.win.update()
+        before = view._block_rects[id(view.current())]
+        event = SimpleNamespace(delta=120, x=view.canvas.winfo_width() // 2,
+                                y=view.canvas.winfo_height() // 2)
+        view._on_wheel(event)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and view._zoom_job is not None:
+            view.win.update()
+            time.sleep(0.004)
+        view.win.update()
+        self.assertIsNone(view._zoom_job, "缩放的定时器一直没落地")
+        after = view._block_rects[id(view.current())]
+        self.assertGreater(after[2], before[2] * 1.05, "滚了滚轮画面没变大")
+        view.close()
+
+    def test_panning_into_undrawn_area_repaints(self):
+        """眼前这屏要是没画过，补画一把就得铺满 —— 这是拖画布不露白的兜底。"""
+        self.gui.open_structure()
+        view = self.gui.structure_window
+        view.win.update()
+        view.set_mode('mindmap')
+        view.win.update()
+        # 假装"上次画的是十万八千里外"：把已画范围整个挪走，眼前这屏就是没画过的
+        view._drawn_top = view._drawn_bottom = view.canvas.canvasy(0) + 10 ** 6
+        self.assertFalse(view._viewport_covered(), "已画范围都挪走了居然还算'画过了'")
+        view._pan_repaint()
+        self.assertTrue(view._viewport_covered(), "补画完眼前还是没铺满")
+        view.close()
 
     def test_expand_all_and_search_leave_no_placeholder_behind(self):
         self.gui.expand_all()
