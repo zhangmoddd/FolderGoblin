@@ -4,12 +4,12 @@
 """
 
 import ctypes
+import gc
 import os
 import queue
 import threading
 import time
 import tkinter as tk
-from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Dict, List, Optional
@@ -59,12 +59,17 @@ def get_scale_factor() -> float:
     return 1.0
 
 
-@dataclass
 class FileNode:
-    name: str
-    size: int
-    is_dir: bool
-    children: List['FileNode'] = field(default_factory=list)
+    """一个节点。用 __slots__ 不用 dataclass —— 一次扫描要造三十万个，快很多。"""
+
+    __slots__ = ('name', 'size', 'is_dir', 'children')
+
+    def __init__(self, name: str, size: int, is_dir: bool,
+                 children: Optional[List['FileNode']] = None):
+        self.name = name
+        self.size = size
+        self.is_dir = is_dir
+        self.children = children if children is not None else []
 
     def total_size(self) -> int:
         """Return the cached aggregate size (O(1) for directories)."""
@@ -88,6 +93,8 @@ class AnalysisThread:
 
     BATCH_ENTRY_LIMIT = 256
     BATCH_INTERVAL = 0.12
+    PAUSE_CHECK_EVERY = 512      # 每扫这么多项才查一次"暂停/停止"，省下几十万次加锁
+    CLOCK_CHECK_EVERY = 32       # 每攒这么多项才看一次表，省下几十万次取时间
 
     def __init__(self):
         self.running = False
@@ -107,6 +114,7 @@ class AnalysisThread:
         self._pending_entries = []
         self._pending_deltas = {}
         self._last_flush = 0.0
+        self._entry_tick = 0
 
     def start(self, path: Path) -> int:
         self.stop()
@@ -129,6 +137,7 @@ class AnalysisThread:
             self._pending_entries = []
             self._pending_deltas = {}
             self._last_flush = time.monotonic()
+            self._entry_tick = 0
             self._stop_event.clear()
             self._pause_event.set()
 
@@ -153,11 +162,14 @@ class AnalysisThread:
     def _queue_entry(self, parent_path, node_path, name, size, is_dir, generation):
         if generation != self.generation:
             return
-        self._pending_entries.append((parent_path, node_path, name, size, is_dir))
+        pending = self._pending_entries
+        pending.append((parent_path, node_path, name, size, is_dir))
         if not is_dir:
             self._pending_deltas[parent_path] = self._pending_deltas.get(parent_path, 0) + size
-        now = time.monotonic()
-        if len(self._pending_entries) >= self.BATCH_ENTRY_LIMIT or now - self._last_flush >= self.BATCH_INTERVAL:
+        count = len(pending)
+        if count >= self.BATCH_ENTRY_LIMIT:
+            self._flush_pending(generation)
+        elif not count % self.CLOCK_CHECK_EVERY and time.monotonic() - self._last_flush >= self.BATCH_INTERVAL:
             self._flush_pending(generation)
 
     def _flush_pending(self, generation: int):
@@ -180,13 +192,20 @@ class AnalysisThread:
 
     def _analyze(self, path: Path, generation: int):
         self.directories_scanned = 1
-        root = self._scan_directory(path, (), generation)
-        self._flush_pending(generation)
+        # 扫描期间关掉垃圾回收：要造三十万个节点对象，边造边回收纯属浪费
+        gc_was_on = gc.isenabled()
+        gc.disable()
+        try:
+            root = self._scan_directory(path, (), generation)
+            self._flush_pending(generation)
+        finally:
+            if gc_was_on:
+                gc.enable()
         cancelled = not self._is_active(generation)
         if generation == self.generation:
             self.result = root
-            self.running = False
-            self.paused = False
+            # 先把结果放进队列，再清"在跑"的标记。
+            # 反过来的话，界面可能在中间那一瞬间看到"没在跑、也没结果"，直接收工不干了。
             self.events.put({
                 'type': 'complete',
                 'generation': generation,
@@ -198,14 +217,19 @@ class AnalysisThread:
                 'errors': self.errors,
                 'symlinks': self.symlinks_skipped,
             })
+            self.running = False
+            self.paused = False
 
     def _scan_directory(self, path: Path, relative_path, generation: int) -> FileNode:
         node = FileNode(name=path.name or str(path), size=0, is_dir=True, children=[])
         try:
             with os.scandir(path) as entries:
                 for entry in entries:
-                    if not self._wait_if_paused(generation):
-                        break
+                    self._entry_tick += 1
+                    if self._entry_tick >= self.PAUSE_CHECK_EVERY:
+                        self._entry_tick = 0
+                        if not self._wait_if_paused(generation):
+                            break
                     try:
                         name = entry.name
                         if entry.is_symlink():
@@ -262,6 +286,9 @@ class AnalysisThread:
 
 
 class FolderSizeGUI:
+    SLICE_SECONDS = 0.008        # 每次轮询最多占用主线程 8 毫秒，超了就下一轮接着干
+    MAX_LABEL_REFRESH = 200      # 每轮最多刷新 200 个节点的文字，防止父节点太多把主线程拖住
+
     def __init__(self):
         self.dpi_ok = enable_dpi_awareness()
         self.scale = get_scale_factor() if self.dpi_ok else 1.0
@@ -287,6 +314,12 @@ class FolderSizeGUI:
         self.scan_generation = 0
         self._poll_job = None
         self.live_max_depth = 0
+        self._queue_entries = []      # 等着往树里塞的节点
+        self._queue_deltas = {}       # 等着加到父节点上的大小
+        self._last_stats = None       # 最新一批统计数字，给标题栏用
+        self._pending_complete = None # 扫描线程已干完，等界面把队排空再收尾
+        self._stopping = False
+        self._finished = True         # 本轮收尾（摆完结果、放开按钮）做完了吗
 
         self.setup_styles()
         self.create_widgets()
@@ -631,6 +664,12 @@ class FolderSizeGUI:
         self.path_to_item.clear()
         self.item_to_path.clear()
         self.live_max_depth = 0
+        self._queue_entries = []
+        self._queue_deltas = {}
+        self._last_stats = None
+        self._pending_complete = None
+        self._stopping = False
+        self._finished = False
 
         root_node = FileNode(Path(path).name or str(path), 0, True)
         root_id = self.tree.insert('', 'end', text=root_node.name,
@@ -656,22 +695,49 @@ class FolderSizeGUI:
         self.scan_generation = self.analysis.start(Path(path))
         self._schedule_event_poll()
 
-    def _schedule_event_poll(self):
-        if self._poll_job is None:
-            self._poll_job = self.root.after(60, self._poll_analysis_events)
+    def _schedule_event_poll(self, delay: int = 60, idle: bool = False):
+        if self._poll_job is not None:
+            return
+        # idle=True：一有空就接着干，不走定时器。
+        # Windows 定时器精度只有 15 毫秒左右，用 after(1) 等于每次都白等 30 毫秒。
+        if idle:
+            self._poll_job = self.root.after_idle(self._poll_analysis_events)
+        else:
+            self._poll_job = self.root.after(delay, self._poll_analysis_events)
 
     def _poll_analysis_events(self):
+        """一次轮询 = 一小片活。干完就交还控制权，窗口才能拖动不卡。"""
         self._poll_job = None
+        started = time.monotonic()
+        deadline = started + self.SLICE_SECONDS
+
         events = self.analysis.drain_events()
         for event in events:
             if event.get('generation') != self.scan_generation:
                 continue
             if event['type'] == 'batch':
-                self._apply_live_batch(event)
+                self._queue_entries.extend(event['entries'])
+                deltas = self._queue_deltas
+                for parent_path, delta in event['deltas'].items():
+                    deltas[parent_path] = deltas.get(parent_path, 0) + delta
+                self._last_stats = event
             elif event['type'] == 'complete':
-                self.on_analysis_complete(event)
-        if self.analysis.running or events:
-            self._schedule_event_poll()
+                self._pending_complete = event
+        if self._last_stats is not None:
+            self.total_bytes = self._last_stats['bytes']
+
+        self._insert_slice(deadline)
+        self._apply_queued_deltas()
+        self._refresh_header()
+
+        backlog = bool(self._queue_entries)
+        if self._pending_complete is not None and not backlog:
+            event = self._pending_complete
+            self._pending_complete = None
+            self.on_analysis_complete(event)
+        elif self.analysis.running or events or backlog or not self._finished:
+            # 只要本轮还没收尾，就继续轮询 —— 免得刚好赶上线程换标记那一瞬间，收尾被漏掉
+            self._schedule_event_poll(idle=backlog, delay=10 if backlog else 60)
 
     def _node_values(self, node: FileNode, total: int):
         total = total or self.total_bytes or node.size
@@ -681,51 +747,78 @@ class FolderSizeGUI:
     def _node_tags(self, node: FileNode):
         return ('dir' if node.is_dir else 'file',)
 
-    def _apply_live_batch(self, event):
-        for parent_path, node_path, name, size, is_dir in event['entries']:
-            if node_path in self.path_to_item:
+    def _insert_slice(self, deadline):
+        """把排队的节点往树里塞，塞到这一片的时间用完为止。剩下的下一轮接着塞。"""
+        entries = self._queue_entries
+        path_to_item = self.path_to_item
+        total = len(entries)
+        index = 0
+        while index < total and time.monotonic() < deadline:
+            parent_path, node_path, name, size, is_dir = entries[index]
+            index += 1
+            if node_path in path_to_item:
                 continue
-            parent_id = self.path_to_item.get(parent_path)
+            parent_id = path_to_item.get(parent_path)
             if parent_id is None:
                 continue
-            node = FileNode(name=name, size=size, is_dir=is_dir)
-            item_id = self.tree.insert(
-                parent_id, 'end', text=node.name,
-                values=self._node_values(node, event['bytes']),
-                tags=self._node_tags(node)
-            )
-            self.path_to_item[node_path] = item_id
-            self.live_max_depth = max(self.live_max_depth, len(node_path))
+            node = FileNode(name, size, is_dir)
+            item_id = self.tree.insert(parent_id, 'end', text=name,
+                values=self._node_values(node, self.total_bytes),
+                tags=self._node_tags(node))
+            path_to_item[node_path] = item_id
             self.item_to_path[item_id] = node_path
             self.item_to_node[item_id] = node
+            depth = len(node_path)
+            if depth > self.live_max_depth:
+                self.live_max_depth = depth
+        if index:
+            del entries[:index]
 
-        self.total_bytes = event['bytes']
-
-        changed_paths = set()
-        for parent_path, delta in event['deltas'].items():
+    def _apply_queued_deltas(self):
+        """把攒下来的大小加到各级父节点上。数字全加，但标签每轮最多刷 200 个。"""
+        deltas = self._queue_deltas
+        if not deltas:
+            return
+        self._queue_deltas = {}
+        path_to_item = self.path_to_item
+        item_to_node = self.item_to_node
+        touched = set()
+        for parent_path, delta in deltas.items():
             current = parent_path
             while True:
-                item_id = self.path_to_item.get(current)
-                if item_id:
-                    node = self.item_to_node[item_id]
-                    node.size += delta
-                    changed_paths.add(current)
+                item_id = path_to_item.get(current)
+                if item_id is not None:
+                    node = item_to_node.get(item_id)
+                    if node is not None:
+                        node.size += delta
+                        touched.add(current)
                 if not current:
                     break
                 current = current[:-1]
-
-        for changed_path in changed_paths:
-            item_id = self.path_to_item[changed_path]
-            node = self.item_to_node[item_id]
-            self.tree.item(item_id, values=self._node_values(node, self.total_bytes),
+        if not touched:
+            return
+        for path in list(touched)[:self.MAX_LABEL_REFRESH]:
+            item_id = path_to_item[path]
+            node = item_to_node[item_id]
+            self.tree.item(item_id, text=node.name,
+                values=self._node_values(node, self.total_bytes),
                 tags=self._node_tags(node))
 
-        total_nodes = event['files'] + event['directories']
-        self.total_label.config(text=format_size(event['bytes']))
-        self.count_label.config(text=f"{total_nodes:,}")
+    def _refresh_header(self):
+        stats = self._last_stats
+        if stats is None:
+            return
+        if self._stopping:
+            text = "正在停止..."
+        elif self.analysis.paused:
+            text = f"已暂停  ·  {stats['files']:,} 个文件"
+        else:
+            error_text = f"  ·  读取失败 {stats['errors']} 项" if stats['errors'] else ""
+            text = f"正在扫描 {stats['files']:,} 个文件{error_text}"
+        self.total_label.config(text=format_size(stats['bytes']))
+        self.count_label.config(text=f"{stats['files'] + stats['directories']:,}")
         self.depth_label.config(text=str(self.live_max_depth))
-        error_text = f"  ·  跳过 {event['errors']} 项" if event['errors'] else ""
-        self.scan_label.config(text=f"正在扫描 {event['files']:,} 个文件{error_text}")
+        self.scan_label.config(text=text)
 
     def toggle_pause(self):
         if not self.analysis.running:
@@ -733,15 +826,15 @@ class FolderSizeGUI:
         if self.analysis.paused:
             self.analysis.resume()
             self.pause_btn.config(text="暂停")
-            self.scan_label.config(text=f"正在扫描 {self.analysis.files_scanned:,} 个文件")
         else:
             self.analysis.pause()
             self.pause_btn.config(text="继续")
-            self.scan_label.config(text=f"已暂停  ·  {self.analysis.files_scanned:,} 个文件")
+        self._refresh_header()
 
     def stop_analysis(self):
         if not self.analysis.running:
             return
+        self._stopping = True
         self.analysis.stop()
         self.pause_btn.config(state='disabled', text="暂停")
         self.stop_btn.config(state='disabled')
@@ -762,6 +855,8 @@ class FolderSizeGUI:
         error_text = f"  ·  读取失败 {event['errors']} 项" if event['errors'] else ""
         self.scan_label.config(text=f"{status}  ·  {event['files']:,} 个文件{error_text}")
         self._fill_uncounted(event.get('symlinks', 0), event['errors'])
+        self._stopping = False
+        self._finished = True
 
     def _fill_uncounted(self, symlinks, errors):
         """只列真正没算进总数里的东西 —— 现在除了符号链接和读不到的，一个不落。"""
@@ -785,22 +880,32 @@ class FolderSizeGUI:
         max_depth = 0
         self.item_to_node.clear()
         total = root.size or 1
+        path_to_item = self.path_to_item
+        item_to_node = self.item_to_node
+        tree = self.tree
 
         def adopt(node, rel_path, depth):
             nonlocal node_count, max_depth
             node_count += 1
-            max_depth = max(max_depth, depth)
-            item_id = self.path_to_item.get(rel_path)
-            if item_id:
-                self.item_to_node[item_id] = node
-                self.tree.item(item_id, text=node.name,
-                    values=self._node_values(node, total), tags=self._node_tags(node))
-                for index, child in enumerate(node.children):
-                    child_path = rel_path + (child.name,)
-                    child_id = self.path_to_item.get(child_path)
-                    if child_id:
-                        self.tree.move(child_id, item_id, index)
-                    adopt(child, child_path, depth + 1)
+            if depth > max_depth:
+                max_depth = depth
+            item_id = path_to_item.get(rel_path)
+            if not item_id:
+                return
+            item_to_node[item_id] = node
+            tree.item(item_id, text=node.name,
+                values=self._node_values(node, total), tags=self._node_tags(node))
+            desired = []
+            for child in node.children:
+                child_path = rel_path + (child.name,)
+                child_id = path_to_item.get(child_path)
+                if child_id:
+                    desired.append(child_id)
+                adopt(child, child_path, depth + 1)
+            # 顺序本来就对就不动 —— 否则要为每个节点白调一次 Tcl，收尾时卡一下
+            if desired and tuple(desired) != tree.get_children(item_id):
+                for index, child_id in enumerate(desired):
+                    tree.move(child_id, item_id, index)
 
         adopt(root, (), 0)
         self.total_label.config(text=format_size(root.size))
