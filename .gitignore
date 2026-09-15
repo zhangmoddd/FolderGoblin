@@ -37,5 +37,9 @@ _build_tmp/
 *.zip
 dist/
 
+# ===== 本地杂件，不上传 =====
+1.png
+_gitinfo.txt
+
 # ===== worktree：多 AI 并行开发的工作副本 =====
 worktrees/
