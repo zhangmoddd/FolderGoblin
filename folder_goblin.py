@@ -2665,4 +2665,7 @@ class FolderSizeGUI:
 
 if __name__ == "__main__":
     app = FolderSizeGUI()
+    # 命令行带目录参数：启动后直接开扫（比如 python folder_goblin.py D:\某目录）
+    if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
+        app.root.after(300, lambda: app.start_analysis(sys.argv[1]))
     app.run()

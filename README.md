@@ -14,6 +14,20 @@ A fast, honest folder size analyzer for Windows. No install, no dependencies —
 
 不需要安装 Python，不需要装任何东西，Windows 双击就能跑。
 
+## 界面预览
+
+主界面：从大到小排，大小、占比一目了然；右侧是文件类型统计和「未计入」面板。
+
+![主界面](screenshots/main.png)
+
+方块图：面积就是大小，鼠标停住看完整路径 —— 谁最占地方一眼看穿。
+
+![方块图](screenshots/treemap.png)
+
+思维导图：一层占一列，顺着连线看层级，线越粗 = 越占地方。
+
+![思维导图](screenshots/mindmap.png)
+
 > ⚠️ `FolderGoblin.exe` 和它旁边的 `_internal` 文件夹是**一整套**。
 > 拷给别人时把整个 `FolderGoblin` 文件夹一起拷，只拷 exe 会打不开。
 
@@ -111,6 +125,9 @@ python -m unittest test_folder_goblin
 
 # 直接运行
 python folder_goblin.py
+
+# 带目录参数：启动后直接开扫
+python folder_goblin.py D:\某目录
 
 # 打包（--onedir 文件夹版，别用 --onefile，单文件版每次启动都要先解包，慢好几秒）
 python -m PyInstaller --noconsole --onedir --name FolderGoblin --icon icon.ico --add-data "icon.ico;." --distpath . --workpath _build_tmp --noconfirm folder_goblin.py
