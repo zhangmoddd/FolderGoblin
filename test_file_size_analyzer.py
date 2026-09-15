@@ -40,18 +40,23 @@ class StructureLayoutTests(unittest.TestCase):
         self.assertEqual(squarify([], 0, 0, 100, 100), [])
         self.assertEqual(squarify([('a', 0)], 0, 0, 100, 100), [])
 
-    def test_mindmap_pins_root_on_top_and_keeps_parent_between_children(self):
-        """根节点钉在最上面（一开图就是"根 → 最大的几支"）；
-        底下的节点还是夹在自己孩子们的正中间。"""
+    def test_mindmap_centers_root_between_children(self):
+        """根节点跟着孩子居中（经典导图摆法，开图整棵树就在画面正中）；
+        底下的节点也夹在自己孩子们的正中间。"""
         folder = FileNode('a', 100, True,
                           [FileNode('a1', 60, False), FileNode('a2', 40, False)])
         rows = mindmap_rows(FileNode('root', 100, True, [folder]), 3, 0, 20)
         centre = {node.name: y for node, _level, y in rows}
-        self.assertEqual(centre['root'], 10)                       # 根在最上面
+        self.assertAlmostEqual(centre['root'], (centre['a1'] + centre['a2']) / 2.0)
         self.assertLess(centre['a1'], centre['a'])
         self.assertLess(centre['a'], centre['a2'])
-        self.assertAlmostEqual(centre['a'], (centre['a1'] + centre['a2']) / 2.0)
         self.assertEqual([node.name for node, _l, _y in rows][0], 'root')   # 父在前
+
+    def test_mindmap_root_stays_visible_when_alone(self):
+        """根下头啥都没有（收起了 / 到层了）：根也得有地方站，别算出负数坐标。"""
+        rows = mindmap_rows(FileNode('root', 100, True, []), 3, 0, 20)
+        self.assertEqual(rows[0][2], 10)                            # 中心 = 一半行高
+        self.assertEqual([node.name for node, _l, _y in rows], ['root'])
 
     def test_mindmap_stops_at_the_depth_limit(self):
         mid = FileNode('mid', 1, True, [FileNode('leaf', 1, False)])

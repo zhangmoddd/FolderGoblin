@@ -193,11 +193,11 @@ def _take_row(items, side, scale):
 
 
 def mindmap_rows(root, max_depth, min_size, row_height, collapsed=None):
-    """思维导图排版：根节点钉在最上面，下面一层占一列、从上往下铺。
+    """思维导图排版：根节点竖着居中，孩子一层占一列、上下摊开。
 
     返回 [(节点, 第几层, 中心 y), ...]，父在前、子在后，照着顺序画就行。
     地盘大的排前面（跟列表里一个顺序）—— 一打开图，最大的那几支先入眼。
-    根节点不跟着孩子居中，就钉在顶上 —— 不然图一高，根就跑到屏幕外面去了。
+    根节点跟着孩子居中（经典导图的摆法）：开图把根往画面正中一摆，整棵树就居中了。
     collapsed 里放着的节点当成"收起来了"，它下面的就不铺。
     """
     rows = []
@@ -213,8 +213,6 @@ def mindmap_rows(root, max_depth, min_size, row_height, collapsed=None):
         else:
             centre_y = cursor[0]
             cursor[0] += row_height
-        if level == 0:
-            centre_y = row_height / 2.0            # 根节点钉在最上面
         rows.append((node, level, centre_y))
         return centre_y
 
@@ -859,7 +857,7 @@ class StructureWindow:
         """重画整张图。
 
         focus='center'：画完把当前根节点摆到画面正中（钻进去、退回来就用这个）；
-        focus='top'：把根节点摆在左上角，最大的那几支先入眼（开图、改旋钮用这个）；
+        focus='top'：整棵树上下居中、根节点靠左站好（开图、改旋钮用这个）；
         focus=None：画面一动不动（缩放、收放节点 —— 它们自己会把手底下的东西对回原位）。
         """
         self._render_job = None
@@ -886,7 +884,7 @@ class StructureWindow:
                 self._center_on(node)
             elif focus == 'top':
                 # 开图 / 改旋钮：根节点摆到左上角，最大的那几支先入眼
-                self._show_from_top(node)
+                self._show_centered(node)
 
     def _center_on(self, node):
         """把某个方块挪到画面正中：钻进去的时候，先让人看见自己在哪。"""
@@ -897,13 +895,18 @@ class StructureWindow:
         self._scroll_to(x + width / 2.0 - self.canvas.winfo_width() / 2.0,
                         y + height / 2.0 - self.canvas.winfo_height() / 2.0)
 
-    def _show_from_top(self, node):
-        """把某个方块挪到画面左上角：开图的时候，最大的那几支先入眼。"""
+    def _show_centered(self, node):
+        """开图 / 改旋钮后的落位：整棵树上下居中，根节点靠左站好。
+
+        经典导图的摆法 —— 根在画面竖着的正中间，孩子上下摊开；
+        左右不居中，根贴着左边留一掌宽，右边一列列排出去。
+        """
         rect = self._block_rects.get(id(node))
         if rect is None:
             return
-        x, y, _width, _height = rect
-        self._scroll_to(x - self.px(40), y - self.px(80))
+        x, y, _width, height = rect
+        self._scroll_to(x - self.px(40),
+                        y + height / 2.0 - self.canvas.winfo_height() / 2.0)
 
     def _canvas_size(self):
         return self.canvas.winfo_width(), self.canvas.winfo_height()
